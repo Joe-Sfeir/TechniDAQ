@@ -1,0 +1,39 @@
+[package]
+name    = "powermeter-demo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name       = "powermeter_demo_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri               = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde               = { version = "1", features = ["derive"] }
+serde_json          = "1"
+rusqlite            = { version = "0.31", features = ["bundled"] }
+rust_xlsxwriter     = "0.58"
+
+# ── Async runtime (Tauri already embeds tokio — we just need the macros/time) ─
+tokio         = { version = "1", features = ["rt", "rt-multi-thread", "time", "io-util"] }
+
+# ── Async serial port ─────────────────────────────────────────────────────────
+tokio-serial  = "5.4"
+
+# ── Async Modbus RTU client ───────────────────────────────────────────────────
+# Feature flags:
+#   rtu     → enables rtu::connect_slave and the RTU framer
+#   (no sync feature — we use async/await throughout)
+tokio-modbus  = { version = "0.7", default-features = false, features = ["rtu"] }
+
+[profile.release]
+panic         = "abort"
+codegen-units = 1
+lto           = true
+opt-level     = "s"
+strip         = true
