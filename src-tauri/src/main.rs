@@ -4,17 +4,35 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Key, Nonce,
+};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rusqlite::{params, Connection};
 use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
     Emitter, Manager, RunEvent, State, WindowEvent,
 };
 use tokio::time::sleep;
-use tokio_modbus::prelude::*;   // re-exports: rtu, Reader, Slave, …
+use tokio_modbus::prelude::*;
 use tokio_serial::SerialStream;
+
+// ─── MASTER KEY ───────────────────────────────────────────────────────────────
+//
+// ⚠️  MUST MATCH the MASTER_KEY_HEX in generate_license.js exactly.
+//    Change this before building a production release.
+//    Generate your own: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+//
+const MASTER_KEY_HEX: &str =
+    "6f3d9a2e1b8c4f7a0e5d2b9c6a3f1e8d4b7c0a9e2f5d8b1c4a7e0f3d6b9c2a5f";
+
+// 1-hour activation window: the license key must be used within this many
+// seconds of being generated, preventing replay attacks.
+const ACTIVATION_TTL_SECS: u64 = 3_600;
 
 // ─── Poll State ───────────────────────────────────────────────────────────────
 
@@ -33,6 +51,24 @@ pub struct EngineState {
 
 pub struct SharedEngine(pub Arc<Mutex<EngineState>>);
 pub struct DbConnection(pub Arc<Mutex<Connection>>);
+
+// ─── License Types ────────────────────────────────────────────────────────────
+
+/// Returned by `get_auth_state` to the frontend.
+#[derive(Serialize, Clone, Debug)]
+pub struct AuthState {
+    pub valid:        bool,
+    pub username:     Option<String>,
+    pub project_name: Option<String>,
+    pub expiry_date:  Option<i64>,  // Unix timestamp — frontend may display expiry
+}
+
+/// The JSON payload encrypted inside every license key.
+#[derive(Deserialize, Debug)]
+struct LicensePayload {
+    created_at:    u64, // Unix seconds — token birth time
+    duration_days: u64, // License length in days
+}
 
 // ─── Event Payloads ───────────────────────────────────────────────────────────
 
@@ -66,13 +102,11 @@ const REG_ACTIVE_POWER: u16 = 3053;
 const REG_TOTAL_ENERGY: u16 = 3203;
 const REG_FREQUENCY:    u16 = 3108;
 
-const SLAVE_ID:         u8  = 1;
-const BAUD_RATE:        u32 = 19200;
-const PORT_TIMEOUT_MS:  u64 = 500;
+const SLAVE_ID:        u8  = 1;
+const BAUD_RATE:       u32 = 19200;
+const PORT_TIMEOUT_MS: u64 = 500;
 
 // ─── Byte-order: Schneider ABCD (big-endian words) ────────────────────────────
-// regs[0] = high 16-bit word (bytes A, B)
-// regs[1] = low  16-bit word (bytes C, D)
 
 fn regs_to_f32(regs: &[u16]) -> f32 {
     let bytes = [
@@ -104,8 +138,75 @@ fn now_ms() -> u128 {
         .unwrap_or_default().as_millis()
 }
 
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH)
+        .unwrap_or_default().as_secs()
+}
+
+/// Decode a hex string into bytes without any extra crates.
+fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 {
+        return Err("Hex string has odd length".into());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16)
+            .map_err(|_| format!("Invalid hex byte at position {i}")))
+        .collect()
+}
+
+/// Decrypt a base64-encoded AES-256-GCM license token.
+/// Token format: base64( IV[12] || Ciphertext[N] || AuthTag[16] )
+fn decrypt_license_token(token: &str) -> Result<LicensePayload, String> {
+    // 1. Base64-decode the token
+    let raw = B64.decode(token.trim())
+        .map_err(|e| format!("Invalid license key (base64): {e}"))?;
+
+    // 2. Minimum length: 12 (IV) + 1 (at least 1 byte payload) + 16 (tag) = 29
+    if raw.len() < 29 {
+        return Err("License key is too short".into());
+    }
+
+    // 3. Split components
+    let (iv_bytes, rest) = raw.split_at(12);
+    // rest = ciphertext_bytes + auth_tag_bytes; aes-gcm expects them concatenated
+    let ciphertext_with_tag = rest; // the Aead::decrypt API in aes-gcm 0.10 wants tag appended
+
+    // 4. Build cipher from master key
+    let key_bytes = hex_decode(MASTER_KEY_HEX)
+        .map_err(|_| "Internal error: master key malformed".to_string())?;
+    if key_bytes.len() != 32 {
+        return Err("Internal error: master key must be 32 bytes".into());
+    }
+    let key    = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let nonce  = Nonce::from_slice(iv_bytes);
+
+    // 5. Decrypt (also verifies auth tag)
+    let plaintext = cipher.decrypt(nonce, ciphertext_with_tag)
+        .map_err(|_| "License key is invalid or has been tampered with".to_string())?;
+
+    // 6. Parse JSON payload
+    let payload: LicensePayload = serde_json::from_slice(&plaintext)
+        .map_err(|e| format!("License payload corrupt: {e}"))?;
+
+    Ok(payload)
+}
+
+/// Quick check used by the polling loop — never holds the lock across an await.
+fn is_license_valid(db: &Arc<Mutex<Connection>>) -> bool {
+    let conn = db.lock().unwrap();
+    let now  = now_secs() as i64;
+    conn.query_row(
+        "SELECT expiry_date FROM settings LIMIT 1",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|expiry| now < expiry)
+    .unwrap_or(false)
+}
+
 /// Emit status-changed + meter-fault without holding any Mutex.
-/// Returns immediately; Tauri queues the events.
 fn emit_fault(app: &tauri::AppHandle, engine: &Arc<Mutex<EngineState>>, reason: String) {
     {
         let mut eng = engine.lock().unwrap();
@@ -114,10 +215,10 @@ fn emit_fault(app: &tauri::AppHandle, engine: &Arc<Mutex<EngineState>>, reason: 
         }
     }
     let _ = app.emit("status-changed", StatusEvent { state: PollState::Fault });
-    let _ = app.emit("meter-fault",    FaultEvent   { reason, timestamp_ms: now_ms() });
+    let _ = app.emit("meter-fault",    FaultEvent { reason, timestamp_ms: now_ms() });
 }
 
-// ─── Tauri Commands ───────────────────────────────────────────────────────────
+// ─── Tauri Commands — Existing ────────────────────────────────────────────────
 
 #[tauri::command]
 fn toggle_polling(
@@ -227,9 +328,96 @@ fn export_to_excel(path: String, db: State<DbConnection>) -> Result<usize, Strin
     Ok(n)
 }
 
-// ─── Async Modbus helpers ─────────────────────────────────────────────────────
-//
-// Both functions return Result<_, String> so they can use `?` freely.
+// ─── Tauri Commands — License ─────────────────────────────────────────────────
+
+/// Activate a license key.
+///
+/// Validates the cryptographic token, enforces the 1-hour TTL window, then
+/// persists the computed expiry into SQLite. The next call to `get_auth_state`
+/// will see the app as licensed.
+#[tauri::command]
+fn activate_license(
+    key:          String,
+    username:     String,
+    project_name: String,
+    db:           State<DbConnection>,
+) -> Result<String, String> {
+    // 1. Decode + decrypt the token
+    let payload = decrypt_license_token(&key)?;
+
+    // 2. Enforce the 1-hour activation window
+    let now = now_secs();
+    let age = now.saturating_sub(payload.created_at);
+    if age > ACTIVATION_TTL_SECS {
+        return Err(format!(
+            "Activation token expired ({} minutes old — must be used within 60 minutes of generation).",
+            age / 60
+        ));
+    }
+    // Guard against tokens with a future created_at (clock skew / tampering)
+    if payload.created_at > now + 300 {
+        return Err("Activation token has a future timestamp. Check your system clock.".into());
+    }
+
+    // 3. Calculate the license expiry
+    let expiry_date = (payload.created_at + payload.duration_days * 86_400) as i64;
+
+    // 4. Persist to SQLite — replace any existing license
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM settings", [])
+        .map_err(|e| format!("DB clear failed: {e}"))?;
+    conn.execute(
+        "INSERT INTO settings (username, project_name, expiry_date)
+         VALUES (?1, ?2, ?3)",
+        params![username.trim(), project_name.trim(), expiry_date],
+    )
+    .map_err(|e| format!("DB insert failed: {e}"))?;
+
+    Ok(format!(
+        "License activated for {}. Valid for {} days.",
+        username.trim(),
+        payload.duration_days
+    ))
+}
+
+/// Check whether a valid, non-expired license is present.
+///
+/// Returns `{ valid: true, username, project_name, expiry_date }` if licensed,
+/// or `{ valid: false }` if absent or expired.
+#[tauri::command]
+fn get_auth_state(db: State<DbConnection>) -> Result<AuthState, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let now  = now_secs() as i64;
+
+    let result = conn.query_row(
+        "SELECT username, project_name, expiry_date FROM settings LIMIT 1",
+        [],
+        |r| Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        )),
+    );
+
+    match result {
+        Ok((username, project_name, expiry_date)) if now < expiry_date => {
+            Ok(AuthState {
+                valid: true,
+                username:     Some(username),
+                project_name: Some(project_name),
+                expiry_date:  Some(expiry_date),
+            })
+        }
+        _ => Ok(AuthState {
+            valid:        false,
+            username:     None,
+            project_name: None,
+            expiry_date:  None,
+        }),
+    }
+}
+
+// ─── Async Modbus Helpers ─────────────────────────────────────────────────────
 
 async fn read_f32(
     ctx:  &mut tokio_modbus::client::Context,
@@ -254,7 +442,6 @@ async fn poll_pm2220(
     let active_power = read_f32(ctx, REG_ACTIVE_POWER, "ActivePower").await?  as f64;
     let total_energy = read_f32(ctx, REG_TOTAL_ENERGY, "TotalEnergy").await?  as f64;
 
-    // Frequency optional — fall back to nominal if register not supported
     let frequency = match read_f32(ctx, REG_FREQUENCY, "Frequency").await {
         Ok(f)  => f as f64,
         Err(_) => 50.0,
@@ -278,14 +465,10 @@ async fn poll_pm2220(
     })
 }
 
-// ─── Main polling loop ────────────────────────────────────────────────────────
+// ─── Main Polling Loop ────────────────────────────────────────────────────────
 //
-// Runs on Tauri's Tokio runtime via async_runtime::spawn.
-//
-// RULE: `run_polling_loop` returns (). Therefore NO `?` operator is EVER
-// used directly in this function. All fallible calls use explicit `match`.
-// The only functions that use `?` are `read_f32` and `poll_pm2220`, which
-// both return Result<_, String>.
+// RULE: returns (). Zero `?` operators. All errors use explicit `match`.
+// RULE: std::Mutex guards are NEVER held across an `.await` point.
 
 async fn run_polling_loop(
     engine: Arc<Mutex<EngineState>>,
@@ -296,7 +479,19 @@ async fn run_polling_loop(
     let mut active_port = String::new();
 
     loop {
-        // ── Snapshot state — lock dropped before any .await ───────────────────
+        // ── License gate — checked every tick, lock dropped before .await ──────
+        if !is_license_valid(&db) {
+            // Drop the ctx so the serial port is released while unlicensed
+            if ctx.is_some() {
+                ctx = None;
+                active_port.clear();
+                eprintln!("[engine] License invalid — port released");
+            }
+            sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        // ── Snapshot engine state — lock dropped before any .await ────────────
         let (state, com_port) = {
             let e = engine.lock().unwrap();
             (e.poll.clone(), e.com_port.clone())
@@ -331,7 +526,6 @@ async fn run_polling_loop(
             active_port = com_port.clone();
             eprintln!("[engine] Opening {com_port} @ {BAUD_RATE} 8E1");
 
-            // 1. Open serial port
             let builder = tokio_serial::new(&com_port, BAUD_RATE)
                 .parity(tokio_serial::Parity::Even)
                 .stop_bits(tokio_serial::StopBits::One)
@@ -349,8 +543,6 @@ async fn run_polling_loop(
                 }
             };
 
-            // 2. Build Modbus RTU context
-            //    rtu::connect_slave is async and returns io::Result<Context>
             let new_ctx = match rtu::connect_slave(serial, Slave(SLAVE_ID)).await {
                 Ok(c)  => c,
                 Err(e) => {
@@ -372,14 +564,14 @@ async fn run_polling_loop(
         match reading_result {
             Err(e) => {
                 eprintln!("[engine] Poll error: {e}");
-                ctx = None;            // force reconnect next iteration
+                ctx = None;
                 emit_fault(&app, &engine, e);
                 sleep(Duration::from_secs(1)).await;
                 continue;
             }
 
             Ok(reading) => {
-                // db Mutex is held for the INSERT, then dropped before the next .await
+                // db Mutex held only for the INSERT, dropped before next .await
                 {
                     let conn = db.lock().unwrap();
                     if let Err(e) = conn.execute(
@@ -394,7 +586,7 @@ async fn run_polling_loop(
                             reading.power_factor, reading.frequency,
                         ],
                     ) { eprintln!("[db] {e}"); }
-                } // ← MutexGuard dropped here, well before the next .await
+                } // ← MutexGuard dropped here, before the .await below
 
                 let _ = app.emit("meter-data", &reading);
             }
@@ -404,13 +596,14 @@ async fn run_polling_loop(
     }
 }
 
-// ─── Database initialisation ──────────────────────────────────────────────────
+// ─── Database Initialisation ──────────────────────────────────────────────────
 
 fn init_database(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous  = NORMAL;
 
+        -- Telemetry history (unchanged)
         CREATE TABLE IF NOT EXISTS meter_history (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp    TEXT    NOT NULL,
@@ -424,6 +617,14 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_meter_history_timestamp
             ON meter_history (timestamp);
+
+        -- License / settings (single-row table)
+        CREATE TABLE IF NOT EXISTS settings (
+            id           INTEGER PRIMARY KEY,
+            username     TEXT    NOT NULL,
+            project_name TEXT    NOT NULL,
+            expiry_date  INTEGER NOT NULL   -- Unix timestamp (seconds)
+        );
     ")
 }
 
@@ -498,6 +699,8 @@ fn main() {
             clear_history,
             get_record_count,
             export_to_excel,
+            activate_license,
+            get_auth_state,
         ])
         .build(tauri::generate_context!())
         .expect("build failed")

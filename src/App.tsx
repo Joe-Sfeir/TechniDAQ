@@ -20,6 +20,13 @@ interface FaultEvent  { reason: string; timestamp_ms: number; }
 interface StatusEvent { state: PollState; }
 interface ChartPoint  { time: string; voltage: number; active_power: number; current: number; }
 
+interface AuthState {
+  valid:         boolean;
+  username?:     string;
+  project_name?: string;
+  expiry_date?:  number; // Unix timestamp
+}
+
 type PollState    = "running" | "stopped" | "fault";
 type Theme        = "dark" | "light";
 type ExportStatus = "idle" | "saving" | "success" | "error";
@@ -27,11 +34,322 @@ type Timeframe    = "live" | "1h" | "24h" | "7d" | "all";
 
 const MAX_HISTORY = 60;
 
-// Common Windows COM ports for the dropdown
 const COM_PORT_OPTIONS = [
   "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8",
   "COM9","COM10","COM11","COM12",
 ];
+
+// ─── License Gateway ──────────────────────────────────────────────────────────
+
+function LicenseGateway({ onActivated }: { onActivated: (auth: AuthState) => void }) {
+  const [licenseKey,   setLicenseKey]   = useState("");
+  const [username,     setUsername]     = useState("");
+  const [projectName,  setProjectName]  = useState("");
+  const [error,        setError]        = useState<string | null>(null);
+  const [activating,   setActivating]   = useState(false);
+  const [focusedField, setFocusedField] = useState<string | null>(null);
+
+  const handleActivate = async () => {
+    setError(null);
+    if (!licenseKey.trim())   { setError("License key is required."); return; }
+    if (!username.trim())     { setError("Username is required."); return; }
+    if (!projectName.trim())  { setError("Project name is required."); return; }
+
+    setActivating(true);
+    try {
+      await invoke<string>("activate_license", {
+        key:         licenseKey.trim(),
+        username:    username.trim(),
+        projectName: projectName.trim(),
+      });
+      // Re-query auth state so we get the full record back
+      const auth = await invoke<AuthState>("get_auth_state");
+      onActivated(auth);
+    } catch (err: unknown) {
+      setError(String(err));
+    } finally {
+      setActivating(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !activating) handleActivate();
+  };
+
+  // Shared input style factory
+  const inputStyle = (field: string): React.CSSProperties => ({
+    width: "100%",
+    padding: "12px 16px",
+    background: "rgba(255,255,255,0.04)",
+    border: `1px solid ${focusedField === field ? "rgba(34,68,240,0.7)" : "rgba(255,255,255,0.1)"}`,
+    borderRadius: "8px",
+    color: "#e2e8f0",
+    fontFamily: field === "key" ? "'Share Tech Mono', monospace" : "'Rajdhani', sans-serif",
+    fontSize: field === "key" ? "0.72rem" : "0.95rem",
+    fontWeight: field === "key" ? 400 : 600,
+    letterSpacing: field === "key" ? "0.06em" : "0.04em",
+    outline: "none",
+    transition: "border-color 0.2s ease, box-shadow 0.2s ease",
+    boxShadow: focusedField === field ? "0 0 0 3px rgba(34,68,240,0.15)" : "none",
+  });
+
+  const labelStyle: React.CSSProperties = {
+    display: "block",
+    fontFamily: "'Share Tech Mono', monospace",
+    fontSize: "0.58rem",
+    letterSpacing: "0.25em",
+    color: "#4a5c7a",
+    textTransform: "uppercase",
+    marginBottom: "8px",
+  };
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0,
+      background: "#050608",
+      backgroundImage: "radial-gradient(circle, rgba(26,31,42,0.8) 1px, transparent 1px)",
+      backgroundSize: "28px 28px",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      zIndex: 9999,
+    }}>
+      {/* Ambient glows */}
+      <div style={{
+        position: "absolute", top: -160, left: -160,
+        width: 520, height: 520, borderRadius: "50%",
+        background: "radial-gradient(circle, rgba(34,68,240,0.12) 0%, transparent 70%)",
+        pointerEvents: "none",
+      }} />
+      <div style={{
+        position: "absolute", bottom: -160, right: -160,
+        width: 520, height: 520, borderRadius: "50%",
+        background: "radial-gradient(circle, rgba(0,229,160,0.07) 0%, transparent 70%)",
+        pointerEvents: "none",
+      }} />
+
+      {/* Card */}
+      <div style={{
+        width: "100%", maxWidth: 480,
+        background: "linear-gradient(145deg, #0f1318 0%, #0a0c0f 100%)",
+        border: "1px solid rgba(255,255,255,0.07)",
+        borderRadius: "16px",
+        boxShadow: "0 24px 80px rgba(0,0,0,0.8), inset 0 1px 0 rgba(255,255,255,0.06)",
+        overflow: "hidden",
+        position: "relative",
+        zIndex: 1,
+      }}>
+        {/* Top accent stripe */}
+        <div style={{
+          height: "2px",
+          background: "linear-gradient(90deg, transparent, #2244F0, #00e5a0, transparent)",
+          opacity: 0.8,
+        }} />
+
+        <div style={{ padding: "40px 40px 36px" }}>
+          {/* Brand header */}
+          <div style={{ textAlign: "center", marginBottom: "36px" }}>
+            {/* Bolt icon */}
+            <div style={{
+              width: 52, height: 52, margin: "0 auto 16px",
+              background: "rgba(34,68,240,0.12)",
+              border: "1px solid rgba(34,68,240,0.3)",
+              borderRadius: "12px",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}>
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="#2244F0">
+                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+              </svg>
+            </div>
+
+            <div style={{
+              fontFamily: "'Rajdhani', sans-serif",
+              fontWeight: 700, fontSize: "1.6rem",
+              letterSpacing: "0.08em",
+              color: "#e2e8f0",
+              lineHeight: 1,
+              marginBottom: "6px",
+            }}>TechniDAQ</div>
+
+            <div style={{
+              fontFamily: "'Share Tech Mono', monospace",
+              fontSize: "0.6rem",
+              letterSpacing: "0.22em",
+              color: "#2a3550",
+              textTransform: "uppercase",
+            }}>by Technicat Group · License Activation</div>
+          </div>
+
+          {/* Fields */}
+          <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+
+            {/* License Key */}
+            <div>
+              <label style={labelStyle}>License Key</label>
+              <textarea
+                value={licenseKey}
+                onChange={e => { setLicenseKey(e.target.value); setError(null); }}
+                onFocus={() => setFocusedField("key")}
+                onBlur={() => setFocusedField(null)}
+                onKeyDown={handleKeyDown}
+                placeholder="Paste your license key here…"
+                rows={3}
+                style={{
+                  ...inputStyle("key"),
+                  resize: "none",
+                  lineHeight: 1.6,
+                }}
+              />
+            </div>
+
+            {/* Username + Project Name side by side */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "14px" }}>
+              <div>
+                <label style={labelStyle}>Username</label>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={e => { setUsername(e.target.value); setError(null); }}
+                  onFocus={() => setFocusedField("user")}
+                  onBlur={() => setFocusedField(null)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="e.g. john.smith"
+                  style={inputStyle("user")}
+                />
+              </div>
+              <div>
+                <label style={labelStyle}>Project Name</label>
+                <input
+                  type="text"
+                  value={projectName}
+                  onChange={e => { setProjectName(e.target.value); setError(null); }}
+                  onFocus={() => setFocusedField("proj")}
+                  onBlur={() => setFocusedField(null)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="e.g. Site Alpha"
+                  style={inputStyle("proj")}
+                />
+              </div>
+            </div>
+
+            {/* Error message */}
+            {error && (
+              <div style={{
+                display: "flex", alignItems: "flex-start", gap: "10px",
+                padding: "12px 14px",
+                background: "rgba(249,115,22,0.08)",
+                border: "1px solid rgba(249,115,22,0.3)",
+                borderRadius: "8px",
+              }}>
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none"
+                  stroke="#f97316" strokeWidth={2.5} style={{ flexShrink: 0, marginTop: 1 }}>
+                  <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                  <line x1="12" y1="9" x2="12" y2="13"/>
+                  <line x1="12" y1="17" x2="12.01" y2="17"/>
+                </svg>
+                <span style={{
+                  fontFamily: "'Share Tech Mono', monospace",
+                  fontSize: "0.68rem",
+                  color: "#fb923c",
+                  letterSpacing: "0.04em",
+                  lineHeight: 1.5,
+                }}>{error}</span>
+              </div>
+            )}
+
+            {/* Activate button */}
+            <button
+              onClick={handleActivate}
+              disabled={activating}
+              style={{
+                width: "100%",
+                padding: "13px",
+                background: activating
+                  ? "rgba(34,68,240,0.15)"
+                  : "linear-gradient(135deg, #1635D4, #2244F0)",
+                border: "1px solid rgba(34,68,240,0.5)",
+                borderRadius: "8px",
+                color: activating ? "#4a5c7a" : "#fff",
+                fontFamily: "'Rajdhani', sans-serif",
+                fontWeight: 700,
+                fontSize: "0.875rem",
+                letterSpacing: "0.14em",
+                textTransform: "uppercase",
+                cursor: activating ? "not-allowed" : "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: "10px",
+                transition: "all 0.2s ease",
+                boxShadow: activating ? "none" : "0 4px 20px rgba(34,68,240,0.35)",
+              }}
+            >
+              {activating ? (
+                <>
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none"
+                    stroke="currentColor" strokeWidth={2.5}
+                    style={{ animation: "spin 1s linear infinite" }}>
+                    <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                  </svg>
+                  Activating…
+                </>
+              ) : (
+                <>
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none"
+                    stroke="currentColor" strokeWidth={2.5}>
+                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                  </svg>
+                  Activate License
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Footer note */}
+          <div style={{
+            marginTop: "24px",
+            textAlign: "center",
+            fontFamily: "'Share Tech Mono', monospace",
+            fontSize: "0.55rem",
+            letterSpacing: "0.15em",
+            color: "#2a3550",
+            textTransform: "uppercase",
+          }}>
+            Offline · Cryptographic · AES-256-GCM
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Auth Loading Spinner ─────────────────────────────────────────────────────
+
+function AuthLoadingScreen() {
+  return (
+    <div style={{
+      position: "fixed", inset: 0,
+      background: "#050608",
+      display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center",
+      gap: "20px", zIndex: 9999,
+    }}>
+      <svg viewBox="0 0 24 24" width="28" height="28" fill="none"
+        stroke="#2244F0" strokeWidth={2}
+        style={{ animation: "spin 1s linear infinite", opacity: 0.7 }}>
+        <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+      </svg>
+      <span style={{
+        fontFamily: "'Share Tech Mono', monospace",
+        fontSize: "0.6rem",
+        letterSpacing: "0.3em",
+        color: "#2a3550",
+        textTransform: "uppercase",
+      }}>Verifying License…</span>
+    </div>
+  );
+}
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
 
@@ -69,7 +387,6 @@ function ComPortSelector({
   return (
     <div className="com-port-selector" title={disabled ? "Stop polling to change COM port" : "Select RS485 COM port"}>
       <span className="com-port-label">PORT</span>
-
       {isCustom ? (
         <input
           type="text"
@@ -95,8 +412,6 @@ function ComPortSelector({
           <option value="__custom__">Custom…</option>
         </select>
       )}
-
-      {/* Live port indicator dot */}
       <div className={`com-port-dot ${disabled ? "com-port-dot-active" : "com-port-dot-idle"}`} />
     </div>
   );
@@ -399,12 +714,14 @@ function MetricCard({ label,value,unit,sublabel,subvalue,colorKey,icon,updated }
 // ─── Header ───────────────────────────────────────────────────────────────────
 
 function Header({ pollState, timestamp, frequency, theme, onThemeToggle,
-  onTogglePoll, onClear, onExport, exportStatus, comPort, onComPortChange }: {
+  onTogglePoll, onClear, onExport, exportStatus, comPort, onComPortChange,
+  username, projectName }: {
   pollState: PollState; timestamp: number; frequency: number;
   theme: Theme; onThemeToggle: () => void;
   onTogglePoll: () => void; onClear: () => void;
   onExport: () => void; exportStatus: ExportStatus;
   comPort: string; onComPortChange: (v: string) => void;
+  username: string; projectName: string;
 }) {
   const timeStr = timestamp
     ? new Date(timestamp).toLocaleTimeString("en-GB", { hour12:false })
@@ -435,13 +752,36 @@ function Header({ pollState, timestamp, frequency, theme, onThemeToggle,
         <div className="header-com-row">
           <div className="device-info-secondary">SLAVE ID: 01 · BAUD: 19200 · PARITY: EVEN</div>
           <div className="header-com-divider" />
-          {/* ── COM Port Selector lives here, inline with device info ── */}
-          <ComPortSelector
-            value={comPort}
-            onChange={onComPortChange}
-            disabled={isPolling}
-          />
+          <ComPortSelector value={comPort} onChange={onComPortChange} disabled={isPolling} />
         </div>
+        {/* License identity badge */}
+        {(projectName || username) && (
+          <div style={{
+            display: "flex", alignItems: "center", gap: "8px", marginTop: "3px",
+          }}>
+            {projectName && (
+              <span style={{
+                fontFamily: "'Share Tech Mono', monospace",
+                fontSize: "0.55rem", letterSpacing: "0.16em",
+                color: "#2244F0", textTransform: "uppercase",
+              }}>
+                ⬡ {projectName}
+              </span>
+            )}
+            {projectName && username && (
+              <span style={{ color: "#2a3550", fontSize: "0.55rem" }}>·</span>
+            )}
+            {username && (
+              <span style={{
+                fontFamily: "'Share Tech Mono', monospace",
+                fontSize: "0.55rem", letterSpacing: "0.16em",
+                color: "#4a5c7a", textTransform: "uppercase",
+              }}>
+                {username}
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Right: telemetry + controls */}
@@ -482,6 +822,11 @@ function Header({ pollState, timestamp, frequency, theme, onThemeToggle,
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
+  // ── Auth state ─────────────────────────────────────────────────────────────
+  const [authState,     setAuthState]     = useState<AuthState | null>(null);
+  const [checkingAuth,  setCheckingAuth]  = useState(true);
+
+  // ── Dashboard state ────────────────────────────────────────────────────────
   const [reading, setReading]           = useState<MeterReading | null>(null);
   const [history, setHistory]           = useState<ChartPoint[]>([]);
   const [pollState, setPollState]       = useState<PollState>("stopped");
@@ -495,9 +840,23 @@ export default function App() {
   const toastTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
   const exportResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // ── Apply theme ────────────────────────────────────────────────────────────
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
+
+  // ── Check license on mount ─────────────────────────────────────────────────
+  useEffect(() => {
+    invoke<AuthState>("get_auth_state")
+      .then(auth => {
+        setAuthState(auth);
+        setCheckingAuth(false);
+      })
+      .catch(() => {
+        setAuthState({ valid: false });
+        setCheckingAuth(false);
+      });
+  }, []);
 
   const showToast = useCallback((message: string, type: ToastState["type"]) => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -505,13 +864,16 @@ export default function App() {
     toastTimerRef.current = setTimeout(() => setToast(t => ({ ...t, visible:false })), 4000);
   }, []);
 
-  // Bootstrap
+  // ── Bootstrap dashboard (only runs when licensed) ──────────────────────────
   useEffect(() => {
+    if (!authState?.valid) return;
     invoke<PollState>("get_status").then(setPollState).catch(console.error);
-  }, []);
+  }, [authState?.valid]);
 
-  // Listen to backend events
+  // ── Backend event listeners (only active when licensed) ───────────────────
   useEffect(() => {
+    if (!authState?.valid) return;
+
     const subs: Promise<UnlistenFn>[] = [];
 
     subs.push(listen<MeterReading>("meter-data", e => {
@@ -539,9 +901,9 @@ export default function App() {
     }));
 
     return () => { subs.forEach(p => p.then(fn => fn())); };
-  }, [showToast]);
+  }, [authState?.valid, showToast]);
 
-  // Toggle polling — pass the selected COM port to Rust
+  // ── Toggle polling ─────────────────────────────────────────────────────────
   const handleTogglePoll = useCallback(async () => {
     try {
       const newState = await invoke<PollState>("toggle_polling", {
@@ -558,7 +920,7 @@ export default function App() {
     }
   }, [comPort, showToast]);
 
-  // Clear
+  // ── Clear ──────────────────────────────────────────────────────────────────
   const handleClear = useCallback(async () => {
     try {
       const rows = await invoke<number>("clear_history");
@@ -570,7 +932,7 @@ export default function App() {
     }
   }, [showToast]);
 
-  // Export
+  // ── Export ─────────────────────────────────────────────────────────────────
   const handleExport = useCallback(async () => {
     try {
       setExportStatus("saving");
@@ -593,7 +955,7 @@ export default function App() {
     }
   }, [showToast]);
 
-  // Derived values
+  // ── Derived display values ─────────────────────────────────────────────────
   const fmt           = (n:number|undefined, d:number) => n !== undefined ? n.toFixed(d) : "---.-";
   const voltage       = fmt(reading?.voltage, 1);
   const current       = fmt(reading?.current, 2);
@@ -627,6 +989,20 @@ export default function App() {
     },
   ];
 
+  // ── Render: loading → gateway → dashboard ──────────────────────────────────
+  if (checkingAuth) {
+    return <AuthLoadingScreen />;
+  }
+
+  if (!authState?.valid) {
+    return (
+      <LicenseGateway
+        onActivated={(auth) => setAuthState(auth)}
+      />
+    );
+  }
+
+  // ── Licensed: render full dashboard ───────────────────────────────────────
   return (
     <div className="app-root">
       <div className="ambient-glow glow-tl" />
@@ -639,6 +1015,8 @@ export default function App() {
         onTogglePoll={handleTogglePoll} onClear={handleClear}
         onExport={handleExport} exportStatus={exportStatus}
         comPort={comPort} onComPortChange={setComPort}
+        username={authState.username ?? ""}
+        projectName={authState.project_name ?? ""}
       />
 
       <main className="app-main">
