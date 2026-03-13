@@ -23,9 +23,7 @@ tokio-serial        = "5.4"
 tokio-modbus        = { version = "0.7", default-features = false, features = ["rtu"] }
 
 # ── Licensing ──────────────────────────────────────────────────────────────────
-# AES-256-GCM decryption (matches Node.js crypto output exactly)
 aes-gcm             = "0.10"
-# Base64 decoding of the license key token
 base64              = "0.21"
 
 [profile.release]
