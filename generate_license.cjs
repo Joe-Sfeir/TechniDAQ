@@ -1,136 +1,151 @@
 #!/usr/bin/env node
-// ─────────────────────────────────────────────────────────────────────────────
-// TechniDAQ — Phase 2 Admin License Key Generator
-// Keep this script PRIVATE. Never ship it with the app or commit to public VCS.
+// generate_key.js  — TechniDAQ Phase 5 License Key Generator
 //
 // Usage:
-//   node generate_key.js \
-//     --days 365 \
-//     --username "John Doe" \
-//     --project  "Alpha Plant" \
-//     --meters   "Schneider_PM2220,Socomec_Diris_A40"
+//   node generate_key.js --days 365 --username "John Doe" --project "Site Alpha" --meters "Schneider_PM2220,Socomec_Diris_A40"
+//   node generate_key.js --days 365 --username "John Doe" --project "Site Alpha" --meters "All"
+//   node generate_key.js --days 365 --ttl_hours 24 --username "John Doe" --project "Site Alpha" --meters "All"
 //
-// All four flags are REQUIRED.
-// Requirements: Node.js 16+ (built-in `crypto` only — no npm install needed)
-// ─────────────────────────────────────────────────────────────────────────────
+// --ttl_hours  How many hours the key remains activatable after generation (default: 1).
+//              Use 24 for next-day delivery, 168 for a week, etc.
+//
+// Passing "All" grants access to every profile in profiles.json plus "Custom".
+// "Custom" in --meters explicitly grants the custom device without any named profiles.
+// "Simulation" in --meters activates Simulation Mode: the app generates oscillating mock
+//   data without requiring any physical RS485 hardware.  Useful for sales demos.
+//   Example: --meters "Simulation"  or  --meters "Simulation,Schneider_PM2220"
+
+"use strict";
 
 const crypto = require("crypto");
+const fs     = require("fs");
+const path   = require("path");
 
-// ── MASTER KEY ────────────────────────────────────────────────────────────────
-// 64 hex chars = 32 bytes = AES-256 key.
-// CHANGE THIS before your first production build.
-// Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-// Then paste the SAME value into MASTER_KEY_HEX in main.rs.
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Master Key ───────────────────────────────────────────────────────────────
+// MUST match MASTER_KEY_HEX in src-tauri/src/main.rs exactly.
+// Generate a new one with:  node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 const MASTER_KEY_HEX =
   "6f3d9a2e1b8c4f7a0e5d2b9c6a3f1e8d4b7c0a9e2f5d8b1c4a7e0f3d6b9c2a5f";
 
-const MASTER_KEY = Buffer.from(MASTER_KEY_HEX, "hex");
-if (MASTER_KEY.length !== 32) {
-  console.error("MASTER_KEY_HEX must be exactly 64 hex chars (32 bytes).");
-  process.exit(1);
+// ─── Arg Parsing ──────────────────────────────────────────────────────────────
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const get  = (flag) => { const i = args.indexOf(flag); return i !== -1 ? args[i + 1] : null; };
+  return {
+    days:      parseInt(get("--days")      ?? "365", 10),
+    ttl_hours: parseInt(get("--ttl_hours") ?? "1",   10),
+    username:  get("--username") ?? "",
+    project:   get("--project")  ?? "",
+    meters:    get("--meters")   ?? "",
+  };
 }
 
-// ── Valid meter identifiers (must match METER_LIBRARY_JSON in main.rs) ────────
-const KNOWN_METERS = [
-  "Schneider_PM2220",
-  "Socomec_Diris_A40",
-  "Lovato_DMG",
-];
-
-// ── CLI Argument Parser ───────────────────────────────────────────────────────
-function getArg(flag) {
-  const args  = process.argv.slice(2);
-  const index = args.indexOf(flag);
-  if (index === -1 || index + 1 >= args.length) return null;
-  return args[index + 1];
+// ─── Profile Discovery ────────────────────────────────────────────────────────
+function loadProfileKeys() {
+  const candidates = [
+    path.join(__dirname, "profiles.json"),
+    path.join(__dirname, "src-tauri", "profiles.json"),
+    path.join(process.cwd(), "profiles.json"),
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) {
+      try { return Object.keys(JSON.parse(fs.readFileSync(p, "utf8"))); } catch {}
+    }
+  }
+  console.warn("[warn] profiles.json not found — meter names will not be validated.");
+  return null;
 }
 
-const rawDays   = getArg("--days");
-const username  = getArg("--username");
-const project   = getArg("--project");
-const rawMeters = getArg("--meters");
+// ─── Key Generation ───────────────────────────────────────────────────────────
+function generateKey({ days, ttl_hours, username, project, allowed_meters }) {
+  const payload = JSON.stringify({
+    created_at:    Math.floor(Date.now() / 1000),
+    duration_days: days,
+    ttl_hours,
+    username,
+    project_name:  project,
+    allowed_meters,
+  });
 
-// ── Validation ────────────────────────────────────────────────────────────────
-const errors = [];
-if (!rawDays)   errors.push("  --days <number>     e.g. --days 365");
-if (!username)  errors.push("  --username <string> e.g. --username \"John Doe\"");
-if (!project)   errors.push("  --project <string>  e.g. --project \"Alpha Plant\"");
-if (!rawMeters) errors.push("  --meters <csv>      e.g. --meters \"Schneider_PM2220,Socomec_Diris_A40\"");
+  const masterKey = Buffer.from(MASTER_KEY_HEX, "hex");
+  if (masterKey.length !== 32) throw new Error(`MASTER_KEY_HEX must be 32 bytes, got ${masterKey.length}`);
 
-if (errors.length) {
-  console.error("\n[ERROR] Missing required arguments:\n");
-  errors.forEach(e => console.error(e));
-  console.error(
-    "\nAvailable meter models:\n" +
-    KNOWN_METERS.map(m => `  * ${m}`).join("\n") + "\n"
-  );
-  process.exit(1);
+  const iv        = crypto.randomBytes(12);
+  const cipher    = crypto.createCipheriv("aes-256-gcm", masterKey, iv);
+  const encrypted = Buffer.concat([cipher.update(payload, "utf8"), cipher.final()]);
+  const authTag   = cipher.getAuthTag();
+
+  return Buffer.concat([iv, encrypted, authTag]).toString("base64");
 }
 
-const durationDays = parseInt(rawDays, 10);
-if (isNaN(durationDays) || durationDays <= 0) {
-  console.error("[ERROR] --days must be a positive integer.");
-  process.exit(1);
+// ─── Main ─────────────────────────────────────────────────────────────────────
+function main() {
+  const { days, ttl_hours, username, project, meters } = parseArgs();
+
+  const errors = [];
+  if (!username.trim())                             errors.push("--username is required");
+  if (!project.trim())                              errors.push("--project is required");
+  if (isNaN(days) || days < 1 || days > 3650)       errors.push("--days must be 1–3650");
+  if (isNaN(ttl_hours) || ttl_hours < 1 || ttl_hours > 8760) errors.push("--ttl_hours must be 1–8760 (hours)");
+  if (!meters.trim())                               errors.push("--meters required (comma list or 'All')");
+
+  if (errors.length) {
+    console.error("Errors:\n" + errors.map(e => "  · " + e).join("\n"));
+    console.error([
+      "",
+      "Usage:",
+      '  node generate_key.js \\',
+      '    --days      365 \\',
+      '    --ttl_hours 24  \\',
+      '    --username  "John Doe" \\',
+      '    --project   "Site Alpha" \\',
+      '    --meters    "Schneider_PM2220,Socomec_Diris_A40"',
+      "",
+      "  # Grant all meters:",
+      '    --meters    "All"',
+      "",
+    ].join("\n"));
+    process.exit(1);
+  }
+
+  const profileKeys = loadProfileKeys();
+  let allowed_meters;
+
+  if (meters.trim() === "All") {
+    allowed_meters = ["All"];
+    const list = profileKeys ? profileKeys.join(", ") + ", Custom" : "all profiles + Custom";
+    console.log(`[info] "All" will unlock: ${list}`);
+  } else {
+    allowed_meters = meters.split(",").map(s => s.trim()).filter(Boolean);
+    if (profileKeys) {
+      for (const m of allowed_meters) {
+        if (m !== "Custom" && m !== "Simulation" && !profileKeys.includes(m)) {
+          console.warn(`[warn] "${m}" not found in profiles.json — ignored at runtime.`);
+        }
+      }
+    }
+    console.log(`[info] "Custom" device is always available — no need to list it explicitly.`);
+  }
+
+  const token       = generateKey({ days, ttl_hours, username: username.trim(), project: project.trim(), allowed_meters });
+  const expiryDate  = new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
+  const activByDate = new Date(Date.now() + ttl_hours * 3_600_000).toISOString().replace("T", " ").slice(0, 19) + " UTC";
+  const metersStr   = allowed_meters.join(", ");
+
+  console.log("\n╔══════════════════════════════════════════════════════════════╗");
+  console.log("║              TechniDAQ License Key Generated                ║");
+  console.log("╠══════════════════════════════════════════════════════════════╣");
+  console.log(`║  User      : ${username.trim().slice(0, 49).padEnd(49)}║`);
+  console.log(`║  Project   : ${project.trim().slice(0, 49).padEnd(49)}║`);
+  console.log(`║  Meters    : ${metersStr.slice(0, 49).padEnd(49)}║`);
+  console.log(`║  Expires   : ${expiryDate.padEnd(49)}║`);
+  console.log(`║  Valid     : ${String(days).padEnd(46)} days║`);
+  console.log(`║  Activate by: ${activByDate.padEnd(48)}║`);
+  console.log("╚══════════════════════════════════════════════════════════════╝");
+  console.log("\n── License Key ─────────────────────────────────────────────────\n");
+  console.log(token);
+  console.log("\n────────────────────────────────────────────────────────────────");
+  console.log(`[!] This key must be activated within ${ttl_hours} hour(s). Deliver promptly.\n`);
 }
 
-const allowedMeters = rawMeters.split(",").map(m => m.trim()).filter(Boolean);
-const unknownMeters = allowedMeters.filter(m => !KNOWN_METERS.includes(m));
-if (unknownMeters.length) {
-  console.error(`\n[ERROR] Unknown meter model(s): ${unknownMeters.join(", ")}`);
-  console.error("Available:\n" + KNOWN_METERS.map(m => `  * ${m}`).join("\n") + "\n");
-  process.exit(1);
-}
-if (allowedMeters.length === 0) {
-  console.error("[ERROR] At least one meter model is required.");
-  process.exit(1);
-}
-
-// ── Build Plaintext Payload ───────────────────────────────────────────────────
-// All five fields are encrypted together and verified by the Rust engine.
-// created_at: Unix seconds — used for 1-hour TTL window check.
-const payload = JSON.stringify({
-  created_at:     Math.floor(Date.now() / 1000),
-  duration_days:  durationDays,
-  username:       username.trim(),
-  project_name:   project.trim(),
-  allowed_meters: allowedMeters,
-});
-
-// ── Encrypt: AES-256-GCM ──────────────────────────────────────────────────────
-// Token wire format: base64( IV[12] | Ciphertext[N] | AuthTag[16] )
-const iv     = crypto.randomBytes(12);
-const cipher = crypto.createCipheriv("aes-256-gcm", MASTER_KEY, iv);
-
-let ciphertext = cipher.update(payload, "utf8");
-ciphertext     = Buffer.concat([ciphertext, cipher.final()]);
-const authTag  = cipher.getAuthTag(); // always 16 bytes
-
-const licenseKey = Buffer.concat([iv, ciphertext, authTag]).toString("base64");
-
-// ── Output ────────────────────────────────────────────────────────────────────
-const issuedAt  = new Date();
-const expiresAt = new Date(
-  (Math.floor(Date.now() / 1000) + durationDays * 86400) * 1000
-);
-
-const bar = "=".repeat(64);
-console.log(`\n${bar}`);
-console.log("  TechniDAQ Phase 2 -- License Key Generated");
-console.log(`${bar}\n`);
-console.log(`  Username       : ${username}`);
-console.log(`  Project        : ${project}`);
-console.log(`  Allowed Meters :`);
-allowedMeters.forEach(m => console.log(`                   * ${m}`));
-console.log(`  Duration       : ${durationDays} days`);
-console.log(`  Issued         : ${issuedAt.toISOString()}`);
-console.log(`  Expires        : ${expiresAt.toISOString().slice(0, 10)}`);
-console.log(`  TTL Window     : 60 minutes from now\n`);
-console.log("  LICENSE KEY:");
-console.log(`  ${"-".repeat(62)}`);
-console.log(`  ${licenseKey}`);
-console.log(`  ${"-".repeat(62)}\n`);
-
-if (durationDays <= 7) {
-  console.log(`  [WARN] Short-term key (${durationDays} days). Use for testing only.\n`);
-}
+main();

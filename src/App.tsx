@@ -1,326 +1,642 @@
-// src/App.tsx  — TechniDAQ Phase 3 (Universal SCADA Platform)
+// src/App.tsx  — TechniDAQ Phase 5 (High-Contrast Tabbed SCADA Dashboard)
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from "recharts";
+import {
+  ResponsiveContainer, LineChart, Line,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend,
+} from "recharts";
 import "./App.css";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface RegisterEntry {
-  name:       string;
-  address:    number;
-  length:     number;
-  data_type:  string;
-  multiplier: number;
+  name: string; address: number; length: number;
+  data_type: string; multiplier: number;
 }
-
 interface MeterProfile {
-  model:        string;
-  display_name: string;
-  endianness:   string;
-  baud_rate:    number;
-  parity:       string;
-  registers:    RegisterEntry[];
+  model: string; display_name: string; endianness: string;
+  baud_rate: number; parity: string; registers: RegisterEntry[];
 }
-
+interface DeviceConfig {
+  device_name: string; meter_model: string; slave_id: number;
+  poll_rate_ms: number; selected_registers: RegisterEntry[];
+}
 interface MeterReading {
-  device_id:    string;
-  timestamp_ms: number;
-  data:         Record<string, number>;
+  device_name: string; device_id: string;
+  timestamp_ms: number; data: Record<string, number>;
 }
-
-interface FaultEvent  { reason: string; timestamp_ms: number }
+interface FaultEvent  { device_name: string; reason: string; timestamp_ms: number }
 interface StatusEvent { state: PollState }
-
 interface AuthState {
-  valid:          boolean;
-  username?:      string;
-  project_name?:  string;
-  expiry_date?:   number;
-  allowed_meters: string[];
-}
-
-interface ActiveDevice {
-  profile:            MeterProfile;
-  slaveId:            number;
-  selectedRegisters:  RegisterEntry[];   // predefined + custom
+  valid: boolean; username?: string; project_name?: string;
+  expiry_date?: number; allowed_meters: string[];
 }
 
 type PollState    = "running" | "stopped" | "fault";
-type Theme        = "dark" | "light";
-type ExportStatus = "idle" | "saving" | "success" | "error";
+type Theme        = "dark"   | "light";
+type ExportStatus = "idle"   | "saving"  | "success" | "error";
+
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 const MAX_HISTORY = 60;
-const COM_PORTS   =["COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9","COM10","COM11","COM12"];
-const DATA_TYPES  =["Float32","UInt16","UInt32","INT16","INT32"];
+const COM_PORTS   = ["COM1","COM2","COM3","COM4","COM5","COM6","COM7",
+                     "COM8","COM9","COM10","COM11","COM12"];
+const DATA_TYPES  = ["Float32","UInt16","UInt32","INT16","INT32"];
 
-// ─── Color Palette for Dynamic Cards ─────────────────────────────────────────
+const DEFAULT_DEVICE = (): DeviceConfig => ({
+  device_name:"", meter_model:"", slave_id:1, poll_rate_ms:1000, selected_registers:[],
+});
 
-const ACCENT_PALETTES =[
-  { bg: "rgba(34,68,240,0.08)",  border: "rgba(34,68,240,0.25)",  text: "#6b8fff",  bar: "#2244F0" },
-  { bg: "rgba(245,158,11,0.08)", border: "rgba(245,158,11,0.25)", text: "#fbbf24",  bar: "#D97706" },
-  { bg: "rgba(168,85,247,0.08)", border: "rgba(168,85,247,0.25)", text: "#c084fc",  bar: "#9333EA" },
-  { bg: "rgba(16,185,129,0.08)", border: "rgba(16,185,129,0.25)", text: "#34d399",  bar: "#059669" },
-  { bg: "rgba(239,68,68,0.08)",  border: "rgba(239,68,68,0.25)",  text: "#f87171",  bar: "#DC2626" },
-  { bg: "rgba(20,184,166,0.08)", border: "rgba(20,184,166,0.25)", text: "#2dd4bf",  bar: "#0D9488" },
-  { bg: "rgba(249,115,22,0.08)", border: "rgba(249,115,22,0.25)", text: "#fb923c",  bar: "#EA580C" },
-  { bg: "rgba(99,102,241,0.08)", border: "rgba(99,102,241,0.25)", text: "#818cf8",  bar: "#4F46E5" },
-];
+// ─── Design tokens ────────────────────────────────────────────────────────────
 
-function paletteFor(name: string, idx: number) {
+const CLR = {
+  // page / chrome surfaces
+  bgPage:   (d:boolean) => d ? "#0f1117" : "#f1f5f9",
+  bgCard:   (d:boolean) => d ? "rgba(255,255,255,0.04)"  : "rgba(255,255,255,0.85)",
+  bgHeader: (d:boolean) => d ? "rgba(15,17,23,0.92)"     : "rgba(15,23,42,0.96)",
+  bgTabBar: (d:boolean) => d ? "rgba(15,17,23,0.85)"     : "rgba(255,255,255,0.75)",
+  // borders — deliberately soft
+  border:   (d:boolean) => d ? "rgba(255,255,255,0.08)"  : "rgba(15,23,42,0.10)",
+  borderDim:(d:boolean) => d ? "rgba(255,255,255,0.04)"  : "rgba(15,23,42,0.06)",
+  // text — high contrast where it counts
+  text1:    (d:boolean) => d ? "#f1f5f9"  : "#0f172a",
+  text2:    (d:boolean) => d ? "#94a3b8"  : "#475569",
+  text3:    (d:boolean) => d ? "#3d4a5e"  : "#94a3b8",
+  // brand accents
+  blue:   "#3b82f6",
+  green:  "#22c55e",
+  amber:  "#f59e0b",
+  red:    "#ef4444",
+  purple: "#a855f7",
+  teal:   "#14b8a6",
+  orange: "#f97316",
+  indigo: "#6366f1",
+};
+
+// Glass card style helper — the visual centrepiece
+const glass = (isDark:boolean, accent?:string): React.CSSProperties => ({
+  background:  isDark
+    ? "rgba(255,255,255,0.035)"
+    : "rgba(255,255,255,0.82)",
+  border:      `1px solid ${isDark ? "rgba(255,255,255,0.08)" : "rgba(15,23,42,0.09)"}`,
+  borderRadius:"12px",
+  backdropFilter:"blur(12px)",
+  WebkitBackdropFilter:"blur(12px)",
+  boxShadow: isDark
+    ? `0 1px 3px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.05)${accent ? `, 0 0 0 1px ${accent}18` : ""}`
+    : `0 2px 12px rgba(15,23,42,0.07), 0 1px 3px rgba(15,23,42,0.05), inset 0 1px 0 rgba(255,255,255,0.9)`,
+});
+
+// Dot-grid CSS injected once into <head>
+const DOT_GRID_CSS = `
+  .tdaq-page {
+    background-color: var(--pg);
+    background-image: radial-gradient(circle, var(--dot) 1px, transparent 1px);
+    background-size: 22px 22px;
+  }
+  [data-theme="dark"]  { --pg: #0f1117; --dot: rgba(255,255,255,0.055); }
+  [data-theme="light"] { --pg: #f1f5f9; --dot: rgba(15,23,42,0.07); }
+  @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.35} }
+  @keyframes spin { to{transform:rotate(360deg)} }
+`;
+
+const TAB_ACCENTS  = [CLR.blue,CLR.green,CLR.amber,CLR.purple,CLR.red,CLR.teal,CLR.orange,CLR.indigo];
+const LINE_COLORS  = ["#3b82f6","#22c55e","#f59e0b","#a855f7","#ef4444","#14b8a6","#f97316","#6366f1"];
+
+function regPalette(name:string, idx:number) {
   const n = name.toLowerCase();
-  if (n.includes("voltage") || n.includes(" v"))  return ACCENT_PALETTES[0];
-  if (n.includes("current") || n.includes(" a"))  return ACCENT_PALETTES[1];
-  if (n.includes("apparent"))                      return ACCENT_PALETTES[7];
-  if (n.includes("reactive"))                      return ACCENT_PALETTES[4];
-  if (n.includes("active power") || n.includes("power total")) return ACCENT_PALETTES[2];
-  if (n.includes("energy"))                        return ACCENT_PALETTES[3];
-  if (n.includes("frequen"))                       return ACCENT_PALETTES[5];
-  if (n.includes("factor"))                        return ACCENT_PALETTES[6];
-  return ACCENT_PALETTES[idx % ACCENT_PALETTES.length];
+  const P = [
+    { border:CLR.blue,   value:CLR.blue },
+    { border:CLR.amber,  value:CLR.amber },
+    { border:CLR.purple, value:CLR.purple },
+    { border:CLR.green,  value:CLR.green },
+    { border:CLR.red,    value:CLR.red },
+    { border:CLR.teal,   value:CLR.teal },
+    { border:CLR.orange, value:CLR.orange },
+    { border:CLR.indigo, value:CLR.indigo },
+  ];
+  if (n.includes("voltage"))                                    return P[0];
+  if (n.includes("current"))                                    return P[1];
+  if (n.includes("apparent"))                                   return P[7];
+  if (n.includes("reactive"))                                   return P[4];
+  if (n.includes("active power")||n.includes("power total"))   return P[2];
+  if (n.includes("energy"))                                     return P[3];
+  if (n.includes("frequen"))                                    return P[5];
+  if (n.includes("factor"))                                     return P[6];
+  return P[idx % P.length];
 }
 
-// ─── Dynamic Metric Card ──────────────────────────────────────────────────────
+// ─── MetricCard ───────────────────────────────────────────────────────────────
 
-function DynamicCard({ name, value, idx, isDark }: {
-  name: string; value: number | undefined; idx: number; isDark: boolean;
+function MetricCard({ name, value, idx, isDark }:{
+  name:string; value:number|undefined; idx:number; isDark:boolean;
 }) {
-  const p = paletteFor(name, idx);
-  const displayVal = value !== undefined && !isNaN(value)
-    ? (Math.abs(value) >= 1000 ? value.toFixed(1) : value.toFixed(3))
+  const p      = regPalette(name, idx);
+  const hasVal = value !== undefined && !isNaN(value);
+  const abs    = hasVal ? Math.abs(value!) : 0;
+  const display = hasVal
+    ? (abs>=10000 ? value!.toFixed(0) : abs>=100 ? value!.toFixed(1)
+       : abs>=1   ? value!.toFixed(2) : value!.toFixed(4))
     : "——";
 
   return (
     <div style={{
-      background: isDark ? p.bg : p.bg.replace("0.08", "0.05"),
-      border: `1px solid ${p.border}`,
-      borderRadius: "10px",
-      padding: "18px 20px 14px",
-      display: "flex",
-      flexDirection: "column",
-      gap: "6px",
-      position: "relative",
-      overflow: "hidden",
-      minWidth: 0,
+      ...glass(isDark),
+      padding:      "0",
+      display:      "flex", flexDirection:"column",
+      minWidth:     0, overflow:"hidden",
+      position:     "relative",
+      transition:   "box-shadow 0.2s ease",
     }}>
-      <div style={{ position:"absolute", top:0, left:0, right:0, height:"2px", background: `linear-gradient(90deg, ${p.bar}, transparent)` }} />
+      {/* Delicate top accent line */}
       <div style={{
-        fontFamily: "'Share Tech Mono', monospace", fontSize: "0.55rem",
-        letterSpacing: "0.22em", textTransform: "uppercase", color: isDark ? "#4a5c7a" : "#8fa0cc",
-      }}>{name}</div>
-      <div style={{ display:"flex", alignItems:"baseline", gap:"6px" }}>
-        <span style={{
-          fontFamily: "'Share Tech Mono', monospace", fontSize: "1.6rem",
-          fontWeight: 700, color: p.text, letterSpacing: "-0.02em", lineHeight: 1,
-        }}>{displayVal}</span>
+        height:"2px", width:"100%", flexShrink:0,
+        background:`linear-gradient(90deg, ${p.border}, ${p.border}88, transparent)`,
+      }}/>
+
+      <div style={{ padding:"14px 16px 14px", display:"flex", flexDirection:"column", gap:"8px" }}>
+        {/* Label */}
+        <div style={{
+          fontSize:"0.6rem", fontFamily:"'Share Tech Mono',monospace",
+          letterSpacing:"0.18em", textTransform:"uppercase",
+          color:CLR.text3(isDark),
+          whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+        }}>{name}</div>
+
+        {/* Value — maximum legibility */}
+        <div style={{
+          fontSize:"1.75rem", fontWeight:700,
+          fontFamily:"'Share Tech Mono',monospace",
+          letterSpacing:"-0.03em", lineHeight:1,
+          color: hasVal ? CLR.text1(isDark) : CLR.text3(isDark),
+        }}>{display}</div>
+
+        {/* Accent progress bar */}
+        <div style={{ height:"2px", borderRadius:"1px",
+          background:CLR.borderDim(isDark), overflow:"hidden" }}>
+          {hasVal && (
+            <div style={{
+              height:"100%", borderRadius:"1px",
+              width:`${Math.min(100,(Math.abs(value!)/500)*100)}%`,
+              background:`linear-gradient(90deg,${p.border},${p.border}99)`,
+              transition:"width 0.5s ease",
+            }}/>
+          )}
+        </div>
       </div>
+
+      {/* Subtle glow blob in card corner */}
       <div style={{
-        height: "2px", marginTop: "4px", borderRadius: "1px", overflow: "hidden",
-        background: isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.05)",
-      }}>
-        {value !== undefined && !isNaN(value) && (
-          <div style={{
-            height: "100%", borderRadius: "1px", transition: "width 0.5s ease",
-            width: `${Math.min(100, Math.abs(value / 500) * 100)}%`, background: p.bar,
-          }} />
-        )}
-      </div>
+        position:"absolute", bottom:0, right:0,
+        width:"60px", height:"60px",
+        background:`radial-gradient(circle at 100% 100%, ${p.border}22, transparent 70%)`,
+        pointerEvents:"none",
+      }}/>
     </div>
   );
 }
 
-// ─── Device Setup Modal ───────────────────────────────────────────────────────
+// ─── DeviceTabBar ─────────────────────────────────────────────────────────────
 
-interface CustomRegisterDraft {
-  name: string; address: string; length: string; data_type: string; multiplier: string;
-}
-
-const EMPTY_DRAFT: CustomRegisterDraft = {
-  name: "", address: "", length: "2", data_type: "Float32", multiplier: "1.0",
-};
-
-function DeviceSetupModal({
-  profiles, initialModel, initialSlaveId, initialSelected,
-  onSave, onClose, theme,
-}: {
-  profiles: MeterProfile[]; initialModel: string; initialSlaveId: number; initialSelected: RegisterEntry[];
-  onSave: (model: string, slaveId: number, regs: RegisterEntry[]) => void; onClose: () => void; theme: Theme;
+function DeviceTabBar({ devices, activeTab, onSelect, pollState, isDark }:{
+  devices:DeviceConfig[]; activeTab:string; onSelect:(n:string)=>void;
+  pollState:PollState; isDark:boolean;
 }) {
-  const isDark = theme === "dark";
-  const [selectedModel,  setSelectedModel]  = useState(initialModel || (profiles[0]?.model ?? ""));
-  const [slaveId,        setSlaveId]        = useState(initialSlaveId);
-  const [searchQuery,    setSearchQuery]    = useState("");
-  const [checked,        setChecked]        = useState<Set<string>>(() => new Set(initialSelected.map(r => r.name)));
-  const [customRegs,     setCustomRegs]     = useState<RegisterEntry[]>(
-    initialSelected.filter(r => !profiles.flatMap(p=>p.registers).some(lr => lr.name === r.name))
-  );
-  const[draft,          setDraft]          = useState<CustomRegisterDraft>(EMPTY_DRAFT);
-  const[draftError,     setDraftError]     = useState<string | null>(null);
-
-  const profileRegs = useMemo(() => profiles.find(p => p.model === selectedModel)?.registers ?? [], [profiles, selectedModel]);
-
-  const filteredRegs = useMemo(() => {
-    const q = searchQuery.toLowerCase();
-    return profileRegs.filter(r => r.name.toLowerCase().includes(q) || String(r.address).includes(q) || r.data_type.toLowerCase().includes(q));
-  }, [profileRegs, searchQuery]);
-
-  const filteredCustom = customRegs.filter(r => r.name.toLowerCase().includes(searchQuery.toLowerCase()));
-  const allFilteredNames  =[...filteredRegs.map(r => r.name), ...filteredCustom.map(r => r.name)];
-  const allCheckedInView  = allFilteredNames.length > 0 && allFilteredNames.every(n => checked.has(n));
-
-  const handleModelChange = (model: string) => {
-    setSelectedModel(model);
-    const newProfile = profiles.find(p => p.model === model);
-    if (newProfile) setChecked(new Set(newProfile.registers.map(r => r.name)));
-    setSearchQuery("");
-  };
-
-  const toggleReg = (name: string) => setChecked(prev => { const s = new Set(prev); s.has(name) ? s.delete(name) : s.add(name); return s; });
-  const toggleAll = () => {
-    if (allCheckedInView) setChecked(prev => { const s = new Set(prev); allFilteredNames.forEach(n => s.delete(n)); return s; });
-    else setChecked(prev => { const s = new Set(prev); allFilteredNames.forEach(n => s.add(n)); return s; });
-  };
-
-  const addCustomRegister = () => {
-    setDraftError(null);
-    if (!draft.name.trim()) { setDraftError("Name is required."); return; }
-    const addr = parseInt(draft.address, 10);
-    if (isNaN(addr) || addr < 0 || addr > 65535) { setDraftError("Address must be 0–65535."); return; }
-    const len = parseInt(draft.length, 10);
-    if (![1,2,4].includes(len)) { setDraftError("Length must be 1, 2, or 4."); return; }
-    const mult = parseFloat(draft.multiplier);
-    if (isNaN(mult)) { setDraftError("Multiplier must be a number."); return; }
-    if (customRegs.some(r => r.name === draft.name.trim())) { setDraftError("A register with this name already exists."); return; }
-
-    const newReg: RegisterEntry = { name: draft.name.trim(), address: addr, length: len, data_type: draft.data_type, multiplier: mult };
-    setCustomRegs(prev => [...prev, newReg]);
-    setChecked(prev => new Set([...prev, newReg.name]));
-    setDraft(EMPTY_DRAFT);
-  };
-
-  const removeCustomReg = (name: string) => {
-    setCustomRegs(prev => prev.filter(r => r.name !== name));
-    setChecked(prev => { const s = new Set(prev); s.delete(name); return s; });
-  };
-
-  const handleSave = () => {
-    if (slaveId < 1 || slaveId > 247) { alert("Slave ID must be 1–247"); return; }
-    const allRegs =[...profileRegs, ...customRegs].filter(r => checked.has(r.name));
-    if (allRegs.length === 0) { alert("Select at least one register."); return; }
-    onSave(selectedModel, slaveId, allRegs);
-  };
-
-  const bg       = isDark ? "#0c0f14"                  : "#ffffff";
-  const border   = isDark ? "rgba(255,255,255,0.07)"   : "rgba(22,53,212,0.1)";
-  const textPri  = isDark ? "#e2e8f0"                  : "#0f172a";
-  const textSec  = isDark ? "#4a5c7a"                  : "#8fa0cc";
-  const inputBg  = isDark ? "rgba(255,255,255,0.04)"   : "rgba(22,53,212,0.03)";
-  const inputBrd = isDark ? "rgba(255,255,255,0.1)"    : "rgba(22,53,212,0.15)";
-  const accent   = "#2244F0";
-  const rowHover = isDark ? "rgba(255,255,255,0.03)"   : "rgba(22,53,212,0.04)";
-
-  const inputStyle: React.CSSProperties = {
-    background: inputBg, border: `1px solid ${inputBrd}`, borderRadius: "6px",
-    color: textPri, fontFamily: "'Share Tech Mono', monospace",
-    fontSize: "0.75rem", letterSpacing: "0.05em", outline: "none", padding: "7px 10px",
-  };
-
-  const labelStyle: React.CSSProperties = {
-    fontFamily: "'Share Tech Mono', monospace", fontSize: "0.52rem",
-    letterSpacing: "0.22em", color: textSec, textTransform: "uppercase", display: "block", marginBottom: "5px",
-  };
-
-  const totalSelected = [...profileRegs, ...customRegs].filter(r => checked.has(r.name)).length;
-
+  if (devices.length === 0) return null;
   return (
-    <div style={{ position: "fixed", inset: 0, zIndex: 9998, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center", padding: "24px" }} onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div style={{ width: "100%", maxWidth: "820px", maxHeight: "90vh", background: bg, border: `1px solid ${border}`, borderRadius: "14px", boxShadow: "0 32px 100px rgba(0,0,0,0.6)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
-        <div style={{ height: "2px", background: `linear-gradient(90deg, transparent, ${accent}, #00e5a0, transparent)` }} />
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding: "18px 24px 14px", borderBottom: `1px solid ${border}`, flexShrink: 0 }}>
-          <div>
-            <div style={{ fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:"1.1rem", letterSpacing:"0.1em", color:textPri }}>Configure Device</div>
-            <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.58rem", letterSpacing:"0.18em", color:textSec, marginTop:"2px" }}>{totalSelected} register{totalSelected !== 1 ? "s" : ""} selected</div>
-          </div>
-          <button onClick={onClose} style={{ background:"none", border:`1px solid ${border}`, borderRadius:"6px", color:textSec, cursor:"pointer", padding:"5px 10px", fontFamily:"'Share Tech Mono',monospace", fontSize:"0.6rem", letterSpacing:"0.1em" }}>ESC</button>
-        </div>
-        <div style={{ flex:1, overflowY:"auto", padding:"20px 24px", display:"flex", flexDirection:"column", gap:"20px" }}>
-          <div style={{ display:"grid", gridTemplateColumns:"1fr auto", gap:"14px", alignItems:"end" }}>
-            <div>
-              <label style={labelStyle}>Meter Model</label>
-              <select value={selectedModel} onChange={e => handleModelChange(e.target.value)} style={{ ...inputStyle, width:"100%" }}>
-                {profiles.map(p => <option key={p.model} value={p.model}>{p.display_name}</option>)}
-              </select>
-            </div>
-            <div>
-              <label style={labelStyle}>Slave ID</label>
-              <input type="number" min={1} max={247} value={slaveId} onChange={e => { const v = parseInt(e.target.value,10); if (v>=1&&v<=247) setSlaveId(v); }} style={{ ...inputStyle, width:"70px", textAlign:"center" }} />
-            </div>
-          </div>
-          <div style={{ display:"flex", flexDirection:"column", gap:"10px" }}>
-            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:"12px" }}>
-              <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.6rem", letterSpacing:"0.2em", color:textSec, textTransform:"uppercase" }}>Registers ({filteredRegs.length + filteredCustom.length} shown)</div>
-              <div style={{ display:"flex", alignItems:"center", gap:"8px", flex:1, justifyContent:"flex-end" }}>
-                <input type="text" value={searchQuery} placeholder="Search registers…" onChange={e => setSearchQuery(e.target.value)} style={{ ...inputStyle, width:"180px", padding:"5px 10px" }} />
-                <button onClick={toggleAll} style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.58rem", letterSpacing:"0.1em", padding:"5px 10px", background: allCheckedInView ? `rgba(34,68,240,0.15)` : "transparent", border: `1px solid ${allCheckedInView ? "rgba(34,68,240,0.4)" : inputBrd}`, borderRadius:"5px", color: allCheckedInView ? "#6b8fff" : textSec, cursor:"pointer", whiteSpace:"nowrap" }}>{allCheckedInView ? "Deselect All" : "Select All"}</button>
-              </div>
-            </div>
-            <div style={{ border: `1px solid ${border}`, borderRadius:"8px", maxHeight:"260px", overflowY:"auto" }}>
-              {filteredRegs.length === 0 && filteredCustom.length === 0 ? (
-                <div style={{ padding:"24px", textAlign:"center", color:textSec, fontFamily:"'Share Tech Mono',monospace", fontSize:"0.65rem", letterSpacing:"0.12em" }}>No registers match your search.</div>
-              ) : (
-                <>
-                  {filteredRegs.map(reg => <RegisterRow key={reg.name} reg={reg} checked={checked.has(reg.name)} onToggle={() => toggleReg(reg.name)} isCustom={false} textPri={textPri} textSec={textSec} border={border} accent={accent} rowHover={rowHover} isDark={isDark} />)}
-                  {filteredCustom.map(reg => <RegisterRow key={reg.name} reg={reg} checked={checked.has(reg.name)} onToggle={() => toggleReg(reg.name)} isCustom={true} onRemove={() => removeCustomReg(reg.name)} textPri={textPri} textSec={textSec} border={border} accent={accent} rowHover={rowHover} isDark={isDark} />)}
-                </>
-              )}
-            </div>
-          </div>
-          <div style={{ border:`1px solid ${border}`, borderRadius:"8px", overflow:"hidden" }}>
-            <div style={{ padding:"10px 14px", borderBottom:`1px solid ${border}`, background: isDark ? "rgba(255,255,255,0.02)" : "rgba(22,53,212,0.02)", fontFamily:"'Share Tech Mono',monospace", fontSize:"0.58rem", letterSpacing:"0.2em", color:textSec, textTransform:"uppercase" }}>Add Custom Register</div>
-            <div style={{ padding:"14px" }}>
-              <div style={{ display:"grid", gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr auto", gap:"10px", alignItems:"end" }}>
-                <div><label style={labelStyle}>Name</label><input type="text" value={draft.name} placeholder="e.g. Pump" onChange={e => { setDraft(d => ({...d, name: e.target.value})); setDraftError(null); }} style={{ ...inputStyle, width:"100%" }} /></div>
-                <div><label style={labelStyle}>Address</label><input type="number" min={0} max={65535} value={draft.address} placeholder="0-65535" onChange={e => setDraft(d => ({...d, address: e.target.value}))} style={{ ...inputStyle, width:"100%" }} /></div>
-                <div><label style={labelStyle}>Length</label><select value={draft.length} onChange={e => setDraft(d => ({...d, length: e.target.value}))} style={{ ...inputStyle, width:"100%" }}><option value="1">1 (16-bit)</option><option value="2">2 (32-bit)</option><option value="4">4 (64-bit)</option></select></div>
-                <div><label style={labelStyle}>Data Type</label><select value={draft.data_type} onChange={e => setDraft(d => ({...d, data_type: e.target.value}))} style={{ ...inputStyle, width:"100%" }}>{DATA_TYPES.map(t => <option key={t} value={t}>{t}</option>)}</select></div>
-                <div><label style={labelStyle}>Multiplier</label><input type="text" value={draft.multiplier} placeholder="1.0" onChange={e => setDraft(d => ({...d, multiplier: e.target.value}))} style={{ ...inputStyle, width:"100%" }} /></div>
-                <button onClick={addCustomRegister} style={{ padding:"7px 14px", borderRadius:"6px", background: "rgba(34,68,240,0.15)", border: "1px solid rgba(34,68,240,0.4)", color: "#6b8fff", cursor:"pointer", fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:"0.7rem", letterSpacing:"0.1em", whiteSpace:"nowrap" }}>+ Add</button>
-              </div>
-              {draftError && <div style={{ marginTop:"8px", fontFamily:"'Share Tech Mono',monospace", fontSize:"0.62rem", color:"#f97316", letterSpacing:"0.06em" }}>⚠ {draftError}</div>}
-            </div>
-          </div>
-        </div>
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 24px", borderTop:`1px solid ${border}`, flexShrink:0 }}>
-          <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.58rem", letterSpacing:"0.12em", color:textSec }}>{totalSelected} register{totalSelected !== 1 ? "s" : ""} will be polled per second</span>
-          <div style={{ display:"flex", gap:"10px" }}>
-            <button onClick={onClose} style={{ padding:"8px 18px", borderRadius:"7px", background:"transparent", border:`1px solid ${border}`, color:textSec, cursor:"pointer", fontFamily:"'Rajdhani',sans-serif", fontWeight:600, fontSize:"0.8rem" }}>Cancel</button>
-            <button onClick={handleSave} disabled={totalSelected === 0} style={{ padding:"8px 20px", borderRadius:"7px", background: totalSelected === 0 ? "rgba(34,68,240,0.1)" : "linear-gradient(135deg,#1635D4,#2244F0)", border:"1px solid rgba(34,68,240,0.5)", color: totalSelected === 0 ? "#4a5c7a" : "#fff", cursor: totalSelected === 0 ? "not-allowed" : "pointer", fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:"0.8rem", letterSpacing:"0.08em", boxShadow: totalSelected > 0 ? "0 4px 16px rgba(34,68,240,0.3)" : "none" }}>Save Configuration</button>
-          </div>
-        </div>
-      </div>
+    <div style={{
+      display:"flex", alignItems:"center", gap:"4px",
+      padding:"0 20px",
+      height:"48px",
+      background:CLR.bgTabBar(isDark),
+      borderBottom:`1px solid ${CLR.border(isDark)}`,
+      backdropFilter:"blur(16px)",
+      WebkitBackdropFilter:"blur(16px)",
+      overflowX:"auto", overflowY:"hidden", flexShrink:0,
+    }}>
+      {devices.map((dev,i) => {
+        const isActive = activeTab === dev.device_name;
+        const accent   = TAB_ACCENTS[i % TAB_ACCENTS.length];
+        const isLive   = pollState === "running";
+        const isFault  = pollState === "fault";
+        return (
+          <button key={dev.device_name} onClick={()=>onSelect(dev.device_name)} style={{
+            padding:"0 16px",
+            height:"32px",
+            border: isActive
+              ? `1px solid ${isDark ? "rgba(255,255,255,0.12)" : "rgba(15,23,42,0.12)"}`
+              : "1px solid transparent",
+            borderRadius:"8px",
+            background: isActive
+              ? (isDark ? "rgba(255,255,255,0.08)" : "rgba(255,255,255,0.95)")
+              : "transparent",
+            cursor:"pointer",
+            display:"flex", alignItems:"center", gap:"8px",
+            whiteSpace:"nowrap", flexShrink:0,
+            transition:"all 0.15s ease",
+            boxShadow: isActive
+              ? (isDark ? "0 1px 6px rgba(0,0,0,0.4)" : "0 1px 4px rgba(15,23,42,0.12)")
+              : "none",
+          }}>
+            {/* Live indicator dot */}
+            <span style={{
+              width:"6px", height:"6px", borderRadius:"50%", flexShrink:0,
+              background: isActive
+                ? (isFault ? CLR.red : isLive ? accent : CLR.text3(isDark))
+                : CLR.text3(isDark),
+              boxShadow: isActive && isLive && !isFault ? `0 0 7px ${accent}` : "none",
+              animation: isActive && isLive && !isFault ? "pulse-dot 2s ease-in-out infinite" : "none",
+            }}/>
+            {/* Name */}
+            <span style={{
+              fontFamily:"'Rajdhani',sans-serif",
+              fontWeight: isActive ? 700 : 500,
+              fontSize:"0.83rem", letterSpacing:"0.04em",
+              color: isActive ? CLR.text1(isDark) : CLR.text2(isDark),
+            }}>{dev.device_name||`Device ${i+1}`}</span>
+            {/* Slave ID pill */}
+            <span style={{
+              fontFamily:"'Share Tech Mono',monospace", fontSize:"0.54rem",
+              letterSpacing:"0.08em",
+              color: isActive ? accent : CLR.text3(isDark),
+              padding:"1px 6px", borderRadius:"20px",
+              border:`1px solid ${isActive ? accent+"40" : CLR.border(isDark)}`,
+              background: isActive ? accent+"10" : "transparent",
+            }}>S{dev.slave_id}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }
 
-// ── Register Row ───────────────────────────────────────────────────────────────
+// ─── WaveformChart ────────────────────────────────────────────────────────────
 
-function RegisterRow({ reg, checked, onToggle, isCustom, onRemove, textPri, textSec, border, accent, rowHover, isDark }: any) {
-  const [hover, setHover] = useState(false);
-  return (
-    <div onClick={onToggle} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)} style={{ display:"flex", alignItems:"center", gap:"10px", padding:"7px 12px", background: hover ? rowHover : "transparent", borderBottom: `1px solid ${border}`, cursor:"pointer", userSelect:"none" }}>
-      <div style={{ width:"14px", height:"14px", borderRadius:"3px", flexShrink:0, background: checked ? accent : "transparent", border: `1.5px solid ${checked ? accent : (isDark ? "rgba(255,255,255,0.2)" : "rgba(22,53,212,0.25)")}`, display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.12s ease" }}>
-        {checked && <svg viewBox="0 0 10 10" width="10" height="10"><polyline points="1.5,5 4,7.5 8.5,2" stroke="#fff" strokeWidth="1.5" fill="none" strokeLinecap="round"/></svg>}
-      </div>
-      <span style={{ flex:1, fontFamily:"'Share Tech Mono',monospace", fontSize:"0.7rem", color: checked ? textPri : textSec, letterSpacing:"0.04em", transition:"color 0.12s" }}>
-        {reg.name}
-        {isCustom && <span style={{ marginLeft:"6px", padding:"1px 5px", borderRadius:"3px", background:"rgba(0,229,160,0.12)", color:"#00e5a0", fontFamily:"'Share Tech Mono',monospace", fontSize:"0.5rem", letterSpacing:"0.14em" }}>CUSTOM</span>}
+type ChartPoint = Record<string, string|number>;
+type ViewMode = "chart" | "grid";
+
+function WaveformChart({ history, chartKeys, pollState, tabAccent, isDark }:{
+  history:ChartPoint[]; chartKeys:string[]; pollState:PollState;
+  tabAccent:string; isDark:boolean;
+}) {
+  const [viewMode, setViewMode] = useState<ViewMode>("chart");
+  const stopped   = pollState === "stopped";
+  const gridColor = isDark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.06)";
+  const axisTick  = CLR.text3(isDark);
+
+  // All data keys present in history (preserving first-seen order, excluding "time")
+  const gridKeys = useMemo(()=>{
+    const seen = new Set<string>();
+    const order: string[] = [];
+    history.forEach(pt => Object.keys(pt).forEach(k => {
+      if (k !== "time" && !seen.has(k)) { seen.add(k); order.push(k); }
+    }));
+    return order;
+  }, [history]);
+
+  // Empty state shared between both views
+  const emptyState = (
+    <div style={{
+      position:"absolute", inset:0, display:"flex",
+      flexDirection:"column", alignItems:"center", justifyContent:"center", gap:"10px",
+    }}>
+      <svg viewBox="0 0 24 24" width="28" height="28" fill="none"
+        stroke={CLR.text3(isDark)} strokeWidth={1.5}>
+        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+      </svg>
+      <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.65rem",
+        letterSpacing:"0.2em", color:CLR.text3(isDark), textTransform:"uppercase" }}>
+        {stopped ? "Polling stopped" : "Awaiting data…"}
       </span>
-      <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.6rem", color:textSec, letterSpacing:"0.06em", minWidth:"50px", textAlign:"right" }}>@{reg.address}</span>
-      <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.58rem", color:textSec, letterSpacing:"0.06em", minWidth:"56px", textAlign:"center" }}>{reg.data_type}</span>
-      <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.58rem", color:textSec, letterSpacing:"0.06em", minWidth:"36px", textAlign:"right" }}>×{reg.multiplier}</span>
-      {isCustom && onRemove && <button onClick={e => { e.stopPropagation(); onRemove(); }} style={{ background:"none", border:"none", color:"#f97316", cursor:"pointer", fontSize:"0.8rem", padding:"0 2px", lineHeight:1 }}>✕</button>}
+    </div>
+  );
+
+  return (
+    <div style={{
+      ...glass(isDark),
+      overflow:"hidden", display:"flex", flexDirection:"column",
+    }}>
+      {/* Header */}
+      <div style={{
+        display:"flex", alignItems:"center", justifyContent:"space-between",
+        padding:"12px 16px", borderBottom:`1px solid ${CLR.border(isDark)}`,
+        flexShrink:0,
+      }}>
+        {/* Left: icon + title + count */}
+        <div style={{ display:"flex", alignItems:"center", gap:"10px" }}>
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+            stroke={tabAccent} strokeWidth={2.5}>
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+          </svg>
+          <span style={{ fontFamily:"'Rajdhani',sans-serif", fontWeight:700,
+            fontSize:"0.78rem", letterSpacing:"0.14em", textTransform:"uppercase",
+            color:CLR.text1(isDark) }}>Real-Time Waveform</span>
+          <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.58rem",
+            color:CLR.text3(isDark) }}>{history.length}/{MAX_HISTORY}pts</span>
+        </div>
+
+        {/* Right: view toggle + legend + live badge */}
+        <div style={{ display:"flex", alignItems:"center", gap:"10px" }}>
+
+          {/* ── View mode toggle ── */}
+          <div style={{
+            display:"flex", borderRadius:"6px", overflow:"hidden",
+            border:`1px solid ${CLR.border(isDark)}`,
+          }}>
+            {(["chart","grid"] as ViewMode[]).map((mode)=>{
+              const active = viewMode === mode;
+              return (
+                <button key={mode} onClick={()=>setViewMode(mode)} style={{
+                  padding:"3px 10px", height:"26px",
+                  background: active
+                    ? (isDark ? "rgba(255,255,255,0.10)" : "rgba(15,23,42,0.08)")
+                    : "transparent",
+                  border:"none",
+                  borderRight: mode==="chart" ? `1px solid ${CLR.border(isDark)}` : "none",
+                  cursor:"pointer",
+                  display:"flex", alignItems:"center", gap:"5px",
+                  color: active ? CLR.text1(isDark) : CLR.text3(isDark),
+                  transition:"background 0.15s",
+                }}>
+                  {mode === "chart"
+                    ? <svg viewBox="0 0 24 24" width="11" height="11" fill="none"
+                        stroke="currentColor" strokeWidth={2.2}>
+                        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+                      </svg>
+                    : <svg viewBox="0 0 24 24" width="11" height="11" fill="none"
+                        stroke="currentColor" strokeWidth={2.2}>
+                        <rect x="3" y="3" width="18" height="18" rx="2"/>
+                        <line x1="3" y1="9" x2="21" y2="9"/>
+                        <line x1="3" y1="15" x2="21" y2="15"/>
+                        <line x1="9" y1="3" x2="9" y2="21"/>
+                      </svg>
+                  }
+                  <span style={{
+                    fontFamily:"'Rajdhani',sans-serif", fontWeight: active ? 700 : 500,
+                    fontSize:"0.68rem", letterSpacing:"0.06em",
+                  }}>{mode === "chart" ? "Chart" : "Grid"}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Chart legend (chart mode only) */}
+          {viewMode === "chart" && chartKeys.map((k,i)=>(
+            <div key={k} style={{ display:"flex", alignItems:"center", gap:"5px" }}>
+              <div style={{ width:"10px", height:"3px", borderRadius:"2px",
+                background:LINE_COLORS[i%LINE_COLORS.length] }}/>
+              <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.58rem",
+                color:CLR.text2(isDark), maxWidth:"120px",
+                overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{k}</span>
+            </div>
+          ))}
+
+          {/* Live badge */}
+          <span style={{
+            padding:"2px 8px", borderRadius:"4px",
+            fontFamily:"'Share Tech Mono',monospace", fontSize:"0.56rem", letterSpacing:"0.12em",
+            background: stopped ? CLR.borderDim(isDark) : tabAccent+"20",
+            color:      stopped ? CLR.text3(isDark)     : tabAccent,
+            border:     `1px solid ${stopped ? CLR.borderDim(isDark) : tabAccent+"44"}`,
+          }}>{stopped?"PAUSED":"LIVE"}</span>
+        </div>
+      </div>
+
+      {/* ── Chart view ─────────────────────────────────────────────────────── */}
+      {viewMode === "chart" && (
+        <div style={{ flex:"1 1 0", minHeight:"280px", padding:"8px 4px 8px 0", position:"relative" }}>
+          {history.length === 0 ? emptyState : (
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={history} margin={{ top:8, right:20, left:0, bottom:0 }}>
+                <CartesianGrid stroke={gridColor} strokeDasharray="3 3" vertical={false}/>
+                <XAxis dataKey="time"
+                  tick={{ fontFamily:"'Share Tech Mono',monospace", fontSize:10, fill:axisTick }}
+                  axisLine={{ stroke:CLR.border(isDark) }} tickLine={false}
+                  interval="preserveStartEnd" minTickGap={60}/>
+                {chartKeys.slice(0,1).map(()=>(
+                  <YAxis key="l" yAxisId="l" orientation="left"
+                    tick={{ fontFamily:"'Share Tech Mono',monospace", fontSize:10, fill:LINE_COLORS[0] }}
+                    axisLine={false} tickLine={false} width={56}
+                    tickFormatter={(v:number)=>v.toFixed(1)}/>
+                ))}
+                {chartKeys.slice(1,2).map(()=>(
+                  <YAxis key="r" yAxisId="r" orientation="right"
+                    tick={{ fontFamily:"'Share Tech Mono',monospace", fontSize:10, fill:LINE_COLORS[1] }}
+                    axisLine={false} tickLine={false} width={56}
+                    tickFormatter={(v:number)=>v.toFixed(2)}/>
+                ))}
+                <Tooltip contentStyle={{
+                  background:   isDark?"#1c2128":"#ffffff",
+                  border:       `1px solid ${CLR.border(isDark)}`,
+                  borderRadius: "6px", padding:"8px 12px",
+                  fontFamily:   "'Share Tech Mono',monospace",
+                  fontSize:     "0.66rem", color:CLR.text1(isDark),
+                  boxShadow:    "0 4px 16px rgba(0,0,0,0.3)",
+                }} cursor={{ stroke:CLR.borderDim(isDark), strokeWidth:1, strokeDasharray:"4 4" }}/>
+                <Legend wrapperStyle={{ display:"none" }}/>
+                {chartKeys.map((k,i)=>(
+                  <Line key={k} yAxisId={i===0?"l":"r"} type="monotone" dataKey={k}
+                    stroke={LINE_COLORS[i%LINE_COLORS.length]} strokeWidth={2}
+                    dot={false} activeDot={{ r:4, fill:LINE_COLORS[i%LINE_COLORS.length] }}
+                    isAnimationActive={false}/>
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      )}
+
+      {/* ── Data Grid view ─────────────────────────────────────────────────── */}
+      {viewMode === "grid" && (
+        <div style={{
+          flex:"1 1 0", minHeight:"280px", position:"relative",
+          overflowX:"auto", overflowY:"auto",
+        }}>
+          {history.length === 0 ? emptyState : (
+            <table style={{
+              width:"100%", borderCollapse:"collapse",
+              fontFamily:"'Share Tech Mono',monospace",
+              fontSize:"0.64rem", letterSpacing:"0.03em",
+            }}>
+              <thead>
+                <tr style={{
+                  position:"sticky", top:0, zIndex:2,
+                  background: isDark ? "#0f1117" : "#f1f5f9",
+                  borderBottom:`2px solid ${CLR.border(isDark)}`,
+                }}>
+                  <th style={{
+                    padding:"8px 14px", textAlign:"left", whiteSpace:"nowrap",
+                    fontWeight:700, letterSpacing:"0.14em", textTransform:"uppercase",
+                    fontSize:"0.54rem", color:CLR.text3(isDark),
+                    borderRight:`1px solid ${CLR.border(isDark)}`,
+                    minWidth:"92px",
+                  }}>Timestamp</th>
+                  {gridKeys.map(k => {
+                    const p = regPalette(k, 0);
+                    return (
+                      <th key={k} style={{
+                        padding:"8px 10px", textAlign:"right", whiteSpace:"nowrap",
+                        fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase",
+                        fontSize:"0.52rem", color:p.border,
+                        borderRight:`1px solid ${CLR.border(isDark)}`,
+                        minWidth:"110px",
+                      }}>{k}</th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {[...history].reverse().map((pt, i) => {
+                  const isAlt = i % 2 === 1;
+                  const rowBg = isAlt
+                    ? (isDark ? "rgba(255,255,255,0.025)" : "rgba(15,23,42,0.03)")
+                    : "transparent";
+                  return (
+                    <tr key={i} style={{ background:rowBg }}>
+                      <td style={{
+                        padding:"5px 14px", whiteSpace:"nowrap",
+                        color:CLR.text2(isDark),
+                        borderRight:`1px solid ${CLR.borderDim(isDark)}`,
+                        borderBottom:`1px solid ${CLR.borderDim(isDark)}`,
+                      }}>{String(pt.time)}</td>
+                      {gridKeys.map(k => {
+                        const raw = pt[k];
+                        const num = typeof raw === "number" ? raw : NaN;
+                        const abs = Math.abs(num);
+                        const display = isNaN(num) ? "—"
+                          : abs >= 10000 ? num.toFixed(0)
+                          : abs >= 100   ? num.toFixed(1)
+                          : abs >= 1     ? num.toFixed(3)
+                          :                num.toFixed(5);
+                        const p = regPalette(k, 0);
+                        return (
+                          <td key={k} style={{
+                            padding:"5px 10px", textAlign:"right", whiteSpace:"nowrap",
+                            color: isNaN(num) ? CLR.text3(isDark) : p.value,
+                            borderRight:`1px solid ${CLR.borderDim(isDark)}`,
+                            borderBottom:`1px solid ${CLR.borderDim(isDark)}`,
+                            fontVariantNumeric:"tabular-nums",
+                          }}>{display}</td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── ExportDropdown ───────────────────────────────────────────────────────────
+
+function ExportDropdown({ activeDeviceName, exportStatus, onExport, isDark }:{
+  activeDeviceName:string|undefined; exportStatus:ExportStatus;
+  onExport:(target:string|null)=>void; isDark:boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const busy = exportStatus === "saving";
+
+  useEffect(()=>{
+    if(!open)return;
+    const fn = (e:MouseEvent)=>{if(!ref.current?.contains(e.target as Node))setOpen(false);};
+    document.addEventListener("mousedown",fn);
+    return ()=>document.removeEventListener("mousedown",fn);
+  },[open]);
+
+  const label = {idle:"Export Excel",saving:"Saving…",success:"Exported ✓",error:"Failed ✗"}[exportStatus];
+  const labelColor = exportStatus==="success"?CLR.green : exportStatus==="error"?CLR.red : CLR.text2(isDark);
+
+  const btnBase: React.CSSProperties = {
+    height:"34px", background:isDark?"rgba(255,255,255,0.05)":"#f6f8fa",
+    border:`1px solid ${CLR.border(isDark)}`,
+    fontFamily:"'Rajdhani',sans-serif", fontWeight:600,
+    fontSize:"0.75rem", letterSpacing:"0.06em",
+    cursor:busy?"not-allowed":"pointer", display:"flex", alignItems:"center",
+  };
+
+  return (
+    <div ref={ref} style={{ position:"relative" }}>
+      <div style={{ display:"flex" }}>
+        <button onClick={()=>!busy&&onExport(activeDeviceName??null)} disabled={busy}
+          style={{ ...btnBase, gap:"6px", padding:"0 12px",
+            borderRight:"none", borderRadius:"6px 0 0 6px", color:labelColor }}>
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none"
+            stroke="currentColor" strokeWidth={2}>
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          {label}
+        </button>
+        <button onClick={()=>!busy&&setOpen(o=>!o)} disabled={busy}
+          style={{ ...btnBase, padding:"0 8px", borderRadius:"0 6px 6px 0", color:CLR.text2(isDark) }}>
+          <svg viewBox="0 0 24 24" width="11" height="11" fill="none"
+            stroke="currentColor" strokeWidth={2.5}
+            style={{ transform:open?"rotate(180deg)":"rotate(0)", transition:"transform 0.15s" }}>
+            <polyline points="6 9 12 15 18 9"/>
+          </svg>
+        </button>
+      </div>
+      {open && (
+        <div style={{
+          position:"absolute", top:"calc(100% + 4px)", right:0, width:"220px",
+          background:isDark?"#1c2128":"#ffffff",
+          border:`1px solid ${CLR.border(isDark)}`,
+          borderRadius:"8px", boxShadow:"0 8px 32px rgba(0,0,0,0.3)",
+          zIndex:500, overflow:"hidden",
+        }}>
+          <div style={{ padding:"6px 12px", borderBottom:`1px solid ${CLR.border(isDark)}`,
+            fontFamily:"'Share Tech Mono',monospace", fontSize:"0.52rem",
+            letterSpacing:"0.18em", textTransform:"uppercase", color:CLR.text3(isDark) }}>
+            Export Options
+          </div>
+          {[
+            { label:"Active Meter Only", sub:activeDeviceName??"(none)", target:activeDeviceName??null,
+              icon:CLR.blue, disabled:!activeDeviceName },
+            { label:"All Meters", sub:"Full dataset, all devices", target:null,
+              icon:CLR.green, disabled:false },
+          ].map(opt=>(
+            <button key={opt.label} disabled={opt.disabled}
+              onClick={()=>{if(!opt.disabled){onExport(opt.target);setOpen(false);}}}
+              style={{
+                width:"100%", padding:"10px 14px",
+                background:"transparent", border:"none",
+                display:"flex", alignItems:"center", gap:"10px",
+                cursor:opt.disabled?"not-allowed":"pointer", opacity:opt.disabled?0.4:1,
+                textAlign:"left",
+              }}
+              onMouseEnter={e=>{if(!opt.disabled)(e.currentTarget as HTMLElement).style.background=isDark?"rgba(255,255,255,0.05)":"#f6f8fa";}}
+              onMouseLeave={e=>{(e.currentTarget as HTMLElement).style.background="transparent";}}>
+              <div style={{ width:"28px",height:"28px",borderRadius:"6px",
+                background:opt.icon+"15",border:`1px solid ${opt.icon}30`,
+                display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="none"
+                  stroke={opt.icon} strokeWidth={2}>
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+              </div>
+              <div>
+                <div style={{ fontFamily:"'Rajdhani',sans-serif", fontWeight:600,
+                  fontSize:"0.78rem", color:CLR.text1(isDark) }}>{opt.label}</div>
+                <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.56rem",
+                  color:CLR.text3(isDark), letterSpacing:"0.04em",
+                  maxWidth:"140px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                  {opt.sub}
+                </div>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -328,93 +644,993 @@ function RegisterRow({ reg, checked, onToggle, isCustom, onRemove, textPri, text
 // ─── Toast ────────────────────────────────────────────────────────────────────
 
 interface ToastState { message:string; type:"success"|"error"|"warn"; visible:boolean }
-function Toast({ message, type, visible }: ToastState) {
+
+function Toast({ message, type, visible }:ToastState) {
+  const C = {
+    success:{bg:"#dcfce7",border:"#16a34a",text:"#15803d",icon:"#16a34a"},
+    warn:   {bg:"#fef3c7",border:"#d97706",text:"#92400e",icon:"#d97706"},
+    error:  {bg:"#fee2e2",border:"#dc2626",text:"#991b1b",icon:"#dc2626"},
+  }[type];
   return (
-    <div className={`toast toast-${type} ${visible ? "toast-visible" : "toast-hidden"}`}>
-      {type === "success" && <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2.5}><polyline points="20 6 9 17 4 12"/></svg>}
-      {type === "warn"    && <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2.5}><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>}
-      {type === "error"   && <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2.5}><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>}
+    <div style={{
+      position:"fixed",top:"16px",right:"16px",zIndex:10000,
+      display:"flex",alignItems:"center",gap:"10px",
+      padding:"10px 16px",
+      background:C.bg,border:`1px solid ${C.border}`,
+      borderRadius:"8px",boxShadow:"0 4px 16px rgba(0,0,0,0.15)",
+      fontFamily:"'Rajdhani',sans-serif",fontWeight:600,
+      fontSize:"0.82rem",color:C.text,
+      transform:visible?"translateY(0)":"translateY(-120%)",
+      opacity:visible?1:0,
+      transition:"transform 0.25s ease,opacity 0.25s ease",
+      maxWidth:"360px",
+    }}>
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke={C.icon} strokeWidth={2.5}>
+        {type==="success"&&<polyline points="20 6 9 17 4 12"/>}
+        {type==="warn"   &&<><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></>}
+        {type==="error"  &&<><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></>}
+      </svg>
       <span>{message}</span>
     </div>
   );
 }
 
-// ─── COM Port Selector ────────────────────────────────────────────────────────
+// ─── ComPortSelector ─────────────────────────────────────────────────────────
 
-function ComPortSelector({ value, onChange, disabled }: { value:string; onChange:(v:string)=>void; disabled:boolean }) {
-  const[isCustom, setIsCustom] = useState(false);
+function ComPortSelector({ value, onChange, disabled, isDark }:{
+  value:string; onChange:(v:string)=>void; disabled:boolean; isDark:boolean;
+}) {
+  const [isCustom, setIsCustom] = useState(false);
+  const base: React.CSSProperties = {
+    height:"30px", background:isDark?"rgba(255,255,255,0.06)":"#f6f8fa",
+    border:`1px solid ${CLR.border(isDark)}`,borderRadius:"5px",
+    color:CLR.text1(isDark),outline:"none",
+    fontFamily:"'Share Tech Mono',monospace",fontSize:"0.7rem",letterSpacing:"0.06em",
+    padding:"0 8px",
+  };
   return (
-    <div className="com-port-selector">
-      <span className="com-port-label">PORT</span>
+    <div style={{ display:"flex",alignItems:"center",gap:"6px" }}>
+      <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.52rem",
+        letterSpacing:"0.2em",color:CLR.text3(isDark),textTransform:"uppercase" }}>PORT</span>
       {isCustom
-        ? <input type="text" className="com-port-input" value={value} disabled={disabled}
-            onChange={e => onChange(e.target.value.toUpperCase())}
-            onBlur={() => { if (!value) setIsCustom(false); }} autoFocus maxLength={10} />
-        : <select className="com-port-select"
-            value={COM_PORTS.includes(value) ? value : "__custom__"}
-            onChange={e => { if (e.target.value==="__custom__") setIsCustom(true); else onChange(e.target.value); }}
-            disabled={disabled}>
-            {COM_PORTS.map(p => <option key={p} value={p}>{p}</option>)}
+        ? <input type="text" value={value} disabled={disabled}
+            onChange={e=>onChange(e.target.value.toUpperCase())}
+            onBlur={()=>{if(!value)setIsCustom(false);}}
+            autoFocus maxLength={10} style={{...base,width:"78px"}}/>
+        : <select value={COM_PORTS.includes(value)?value:"__custom__"}
+            onChange={e=>{if(e.target.value==="__custom__")setIsCustom(true);else onChange(e.target.value);}}
+            disabled={disabled} style={{...base,width:"88px",cursor:"pointer"}}>
+            {COM_PORTS.map(p=><option key={p} value={p}>{p}</option>)}
             <option value="__custom__">Custom…</option>
           </select>
       }
-      <div className={`com-port-dot ${disabled ? "com-port-dot-active" : "com-port-dot-idle"}`} />
+      <div style={{ width:"7px",height:"7px",borderRadius:"50%",
+        background:disabled?CLR.green:CLR.text3(isDark),
+        boxShadow:disabled?`0 0 5px ${CLR.green}`:"none" }}/>
+    </div>
+  );
+}
+
+// ─── AppHeader ────────────────────────────────────────────────────────────────
+
+function AppHeader({
+  pollState, lastPollMs, theme, onThemeToggle, onTogglePoll,
+  onClear, onExport, exportStatus, comPort, onComPortChange,
+  username, projectName, onLogout, configuredDevices, activeDeviceName,
+  isSimulation,
+}:{
+  pollState:PollState; lastPollMs:number; theme:Theme;
+  onThemeToggle:()=>void; onTogglePoll:()=>void;
+  onClear:()=>void; onExport:(t:string|null)=>void; exportStatus:ExportStatus;
+  comPort:string; onComPortChange:(v:string)=>void;
+  username:string; projectName:string; onLogout:()=>void;
+  configuredDevices:DeviceConfig[]; activeDeviceName:string|undefined;
+  isSimulation:boolean;
+}) {
+  const isDark    = theme === "dark";
+  const isRunning = pollState === "running";
+  const isFault   = pollState === "fault";
+  const timeStr   = lastPollMs > 0
+    ? new Date(lastPollMs).toLocaleTimeString("en-GB",{hour12:false}) : "--:--:--";
+  const statusColor = isFault ? CLR.red
+    : isRunning && isSimulation ? CLR.amber
+    : isRunning ? CLR.green
+    : CLR.text3(isDark);
+  const statusLabel = isFault ? "FAULT"
+    : isRunning && isSimulation ? "SIMULATION"
+    : isRunning ? "LIVE"
+    : "STOPPED";
+
+  // Inject dot-grid + keyframes once
+  useEffect(()=>{
+    if (document.getElementById("tdaq-global-css")) return;
+    const el = document.createElement("style");
+    el.id = "tdaq-global-css";
+    el.textContent = DOT_GRID_CSS;
+    document.head.appendChild(el);
+  },[]);
+
+  return (
+    <header style={{
+      display:"flex", alignItems:"center", gap:"16px",
+      padding:"0 20px", height:"58px", flexShrink:0,
+      background:CLR.bgHeader(isDark),
+      borderBottom:`1px solid ${CLR.border(isDark)}`,
+      backdropFilter:"blur(20px)",
+      WebkitBackdropFilter:"blur(20px)",
+      position:"relative", zIndex:10,
+    }}>
+      {/* Brand */}
+      <div style={{ display:"flex",alignItems:"center",gap:"10px",flexShrink:0 }}>
+        <div style={{ width:"32px",height:"32px",background:CLR.blue,borderRadius:"7px",
+          display:"flex",alignItems:"center",justifyContent:"center" }}>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="white">
+            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+          </svg>
+        </div>
+        <div>
+          <div style={{ fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:"1rem",
+            letterSpacing:"0.06em",color:"#e6edf3",lineHeight:1 }}>TechniDAQ</div>
+          <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",
+            letterSpacing:"0.14em",color:CLR.text3(isDark),lineHeight:1.5 }}>
+            {username ? `${username} · ${projectName||"Technicat Group"}` : (projectName||"by Technicat Group")}
+          </div>
+        </div>
+      </div>
+
+      {/* Device summary */}
+      <div style={{ flex:1,minWidth:0 }}>
+        <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.62rem",
+          letterSpacing:"0.08em",color:CLR.text2(isDark),
+          overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>
+          {configuredDevices.length>0
+            ? configuredDevices.map(d=>`${d.device_name} [S${d.slave_id}·${d.poll_rate_ms/1000}s]`).join("  ·  ")
+            : "No devices configured — click Configure Bus"}
+        </div>
+      </div>
+
+      {/* Right controls */}
+      <div style={{ display:"flex",alignItems:"center",gap:"10px",flexShrink:0 }}>
+        {/* Last poll */}
+        <div style={{ textAlign:"right" }}>
+          <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",
+            letterSpacing:"0.14em",color:CLR.text3(isDark),textTransform:"uppercase" }}>Last Poll</div>
+          <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.7rem",
+            color:CLR.text1(isDark) }}>{timeStr}</div>
+        </div>
+
+        <div style={{ width:"1px",height:"28px",background:CLR.border(isDark) }}/>
+
+        {/* Status */}
+        <div style={{ display:"flex",alignItems:"center",gap:"6px" }}>
+          <div style={{ width:"8px",height:"8px",borderRadius:"50%",
+            background:statusColor,
+            boxShadow:isRunning?`0 0 8px ${statusColor}`:"none" }}/>
+          <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.65rem",
+            letterSpacing:"0.12em",fontWeight:600,color:statusColor }}>{statusLabel}</span>
+        </div>
+
+        <div style={{ width:"1px",height:"28px",background:CLR.border(isDark) }}/>
+        {isSimulation
+          ? <div style={{
+              display:"flex", alignItems:"center", gap:"6px",
+              padding:"0 10px", height:"28px",
+              background:`${CLR.amber}15`,
+              border:`1px solid ${CLR.amber}44`,
+              borderRadius:"5px",
+            }}>
+              <span style={{ width:"6px",height:"6px",borderRadius:"50%",flexShrink:0,
+                background:CLR.amber,
+                boxShadow:`0 0 5px ${CLR.amber}`,
+                animation:"pulse-dot 2s ease-in-out infinite",
+              }}/>
+              <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.56rem",
+                letterSpacing:"0.14em",color:CLR.amber,textTransform:"uppercase" }}>
+                No Hardware
+              </span>
+            </div>
+          : <ComPortSelector value={comPort} onChange={onComPortChange}
+              disabled={isRunning||isFault} isDark={isDark}/>
+        }
+        <div style={{ width:"1px",height:"28px",background:CLR.border(isDark) }}/>
+
+        {/* Poll toggle */}
+        <button onClick={onTogglePoll} style={{
+          display:"flex",alignItems:"center",gap:"6px",
+          padding:"0 14px",height:"34px",
+          background: isRunning||isFault ? CLR.red+"18" : CLR.blue,
+          border:`1px solid ${isRunning||isFault?CLR.red:CLR.blue}`,
+          borderRadius:"6px",
+          color:isRunning||isFault?CLR.red:"#fff",
+          fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+          fontSize:"0.78rem",letterSpacing:"0.08em",
+          cursor:"pointer",
+          boxShadow:isRunning?"none":`0 2px 8px ${CLR.blue}44`,
+        }}>
+          {isRunning
+            ?<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+            :<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>}
+          {isRunning?"Stop":isFault?"Reset":"Start"}
+        </button>
+
+        <button onClick={onClear} style={{
+          display:"flex",alignItems:"center",gap:"6px",
+          padding:"0 12px",height:"34px",
+          background:isDark?"rgba(255,255,255,0.05)":"#f6f8fa",
+          border:`1px solid ${CLR.border(isDark)}`,borderRadius:"6px",
+          color:CLR.text2(isDark),fontFamily:"'Rajdhani',sans-serif",
+          fontWeight:600,fontSize:"0.75rem",letterSpacing:"0.06em",cursor:"pointer",
+        }}>
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth={2}>
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+          </svg>
+          Clear
+        </button>
+
+        <ExportDropdown activeDeviceName={activeDeviceName} exportStatus={exportStatus}
+          onExport={onExport} isDark={isDark}/>
+
+        <button onClick={onThemeToggle} style={{
+          padding:"0 10px",height:"34px",
+          background:isDark?"rgba(255,255,255,0.05)":"#f6f8fa",
+          border:`1px solid ${CLR.border(isDark)}`,borderRadius:"6px",
+          color:CLR.text2(isDark),cursor:"pointer",
+          display:"flex",alignItems:"center",
+        }}>
+          {theme==="dark"
+            ?<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2}><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/></svg>
+            :<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2}><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>}
+        </button>
+
+        <div style={{ width:"1px",height:"28px",background:CLR.border(isDark) }}/>
+
+        {/* Logout */}
+        <button onClick={onLogout} title="Revoke license &amp; log out" style={{
+          display:"flex",alignItems:"center",gap:"5px",
+          padding:"0 10px",height:"34px",
+          background:"rgba(239,68,68,0.08)",
+          border:`1px solid rgba(239,68,68,0.25)`,borderRadius:"6px",
+          color:CLR.red,cursor:"pointer",
+          fontFamily:"'Rajdhani',sans-serif",fontWeight:600,
+          fontSize:"0.72rem",letterSpacing:"0.06em",
+        }}>
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none"
+            stroke="currentColor" strokeWidth={2}>
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+          Log Out
+        </button>
+      </div>
+    </header>
+  );
+}
+
+// ─── BusBar ───────────────────────────────────────────────────────────────────
+
+function BusBar({ configuredDevices, pollState, onOpenModal, isDark }:{
+  configuredDevices:DeviceConfig[]; pollState:PollState;
+  onOpenModal:()=>void; isDark:boolean;
+}) {
+  const isPolling = pollState==="running"||pollState==="fault";
+  return (
+    <div style={{
+      display:"flex",alignItems:"center",gap:"10px",
+      padding:"0 20px",height:"38px",flexShrink:0,
+      background: isDark?"rgba(15,17,23,0.8)":"rgba(248,250,252,0.8)",
+      borderBottom:`1px solid ${CLR.border(isDark)}`,
+      backdropFilter:"blur(12px)", WebkitBackdropFilter:"blur(12px)",
+    }}>
+      <button onClick={onOpenModal} disabled={isPolling} style={{
+        display:"flex",alignItems:"center",gap:"6px",
+        padding:"0 12px",height:"26px",
+        background:isPolling?"transparent":CLR.blue+"18",
+        border:`1px solid ${isPolling?CLR.borderDim(isDark):CLR.blue+"50"}`,
+        borderRadius:"5px",
+        color:isPolling?CLR.text3(isDark):CLR.blue,
+        fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+        fontSize:"0.7rem",letterSpacing:"0.1em",textTransform:"uppercase",
+        cursor:isPolling?"not-allowed":"pointer",opacity:isPolling?0.45:1,
+      }}>
+        <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth={2.5}>
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        </svg>
+        Configure Bus
+      </button>
+      {isPolling && (
+        <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.54rem",
+          letterSpacing:"0.12em",color:CLR.text3(isDark) }}>
+          Stop polling to reconfigure
+        </span>
+      )}
+      {configuredDevices.length>0 && !isPolling && (
+        <>
+          <span style={{ color:CLR.border(isDark),fontSize:"0.8rem" }}>|</span>
+          {configuredDevices.map((d,i)=>(
+            <div key={d.device_name} style={{ display:"flex",alignItems:"center",gap:"5px" }}>
+              <div style={{ width:"5px",height:"5px",borderRadius:"50%",
+                background:TAB_ACCENTS[i%TAB_ACCENTS.length] }}/>
+              <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.58rem",
+                color:CLR.text2(isDark),letterSpacing:"0.05em" }}>
+                {d.device_name} · S{d.slave_id} · {d.poll_rate_ms/1000}s
+              </span>
+            </div>
+          ))}
+          <span style={{ marginLeft:"auto",fontFamily:"'Share Tech Mono',monospace",
+            fontSize:"0.54rem",color:CLR.text3(isDark) }}>
+            {configuredDevices.reduce((s,d)=>s+d.selected_registers.length,0)} registers total
+          </span>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── DevicePanel (accordion in modal) ────────────────────────────────────────
+
+interface CustomRegDraft {
+  name:string;address:string;length:string;data_type:string;multiplier:string;
+}
+const EMPTY_DRAFT:CustomRegDraft = {name:"",address:"",length:"2",data_type:"Float32",multiplier:"1.0"};
+
+function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove }:{
+  device:DeviceConfig; index:number; profiles:MeterProfile[]; isDark:boolean;
+  onUpdate:(d:DeviceConfig)=>void; onRemove:()=>void;
+}) {
+  const [expanded,  setExpanded]  = useState(index===0);
+  const [search,    setSearch]    = useState("");
+  const [checked,   setChecked]   = useState<Set<string>>(
+    ()=>new Set(device.selected_registers.map(r=>r.name))
+  );
+  const [customRegs,setCustomRegs]= useState<RegisterEntry[]>([]);
+  const [draft,     setDraft]     = useState<CustomRegDraft>(EMPTY_DRAFT);
+  const [draftErr,  setDraftErr]  = useState<string|null>(null);
+
+  const profile     = profiles.find(p=>p.model===device.meter_model);
+  const profileRegs = profile?.registers??[];
+
+  const filtered = useMemo(()=>{
+    const q=search.toLowerCase();
+    return profileRegs.filter(r=>r.name.toLowerCase().includes(q)||String(r.address).includes(q));
+  },[profileRegs,search]);
+  const filteredCustom = customRegs.filter(r=>r.name.toLowerCase().includes(search.toLowerCase()));
+
+  const allNames = [...filtered.map(r=>r.name),...filteredCustom.map(r=>r.name)];
+  const allOn    = allNames.length>0 && allNames.every(n=>checked.has(n));
+
+  useEffect(()=>{
+    const regs = [...profileRegs,...customRegs].filter(r=>checked.has(r.name));
+    onUpdate({...device,selected_registers:regs});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[checked,customRegs]);
+
+  const toggleReg = (name:string) =>
+    setChecked(prev=>{const s=new Set(prev);s.has(name)?s.delete(name):s.add(name);return s;});
+
+  const handleModelChange = (model:string) => {
+    const np=profiles.find(p=>p.model===model);
+    setChecked(new Set((np?.registers??[]).map(r=>r.name)));
+    setCustomRegs([]);
+    onUpdate({...device,meter_model:model,selected_registers:np?.registers??[]});
+  };
+
+  const addCustom = () => {
+    setDraftErr(null);
+    if(!draft.name.trim()){setDraftErr("Name required");return;}
+    const addr=parseInt(draft.address,10);
+    if(isNaN(addr)||addr<0||addr>65535){setDraftErr("Address 0–65535");return;}
+    const len=parseInt(draft.length,10);
+    if(![1,2,4].includes(len)){setDraftErr("Length must be 1, 2, or 4");return;}
+    const mult=parseFloat(draft.multiplier);
+    if(isNaN(mult)){setDraftErr("Multiplier must be a number");return;}
+    if(customRegs.some(r=>r.name===draft.name.trim())){setDraftErr("Name already used");return;}
+    const nr:RegisterEntry={name:draft.name.trim(),address:addr,length:len,data_type:draft.data_type,multiplier:mult};
+    setCustomRegs(p=>[...p,nr]);
+    setChecked(p=>new Set([...p,nr.name]));
+    setDraft(EMPTY_DRAFT);
+  };
+
+  const accent   = TAB_ACCENTS[index%TAB_ACCENTS.length];
+  const border   = CLR.border(isDark);
+  // Poll rate shown in seconds
+  const pollSecs = device.poll_rate_ms/1000;
+
+  const iS: React.CSSProperties = {
+    height:"32px",background:isDark?"rgba(255,255,255,0.04)":"#fff",
+    border:`1px solid ${border}`,borderRadius:"5px",
+    color:CLR.text1(isDark),fontFamily:"'Share Tech Mono',monospace",
+    fontSize:"0.7rem",letterSpacing:"0.04em",outline:"none",padding:"0 8px",width:"100%",
+  };
+  const lS: React.CSSProperties = {
+    display:"block",marginBottom:"4px",
+    fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",
+    letterSpacing:"0.2em",textTransform:"uppercase",color:CLR.text3(isDark),
+  };
+  const selCount = [...profileRegs,...customRegs].filter(r=>checked.has(r.name)).length;
+
+  return (
+    <div style={{ ...glass(isDark), overflow:"hidden", marginBottom:"8px" }}>
+      {/* Accordion header */}
+      <div onClick={()=>setExpanded(e=>!e)} style={{
+        display:"flex",alignItems:"center",gap:"10px",padding:"10px 14px",cursor:"pointer",
+        background:isDark?"rgba(255,255,255,0.02)":"rgba(0,0,0,0.02)",
+        borderBottom:expanded?`1px solid ${border}`:"none",userSelect:"none",
+      }}>
+        <div style={{ width:"3px",height:"18px",borderRadius:"2px",background:accent,flexShrink:0 }}/>
+        <span style={{ fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:"0.85rem",
+          color:CLR.text1(isDark),flex:1,minWidth:0 }}>
+          {device.device_name.trim()||<span style={{opacity:0.4}}>Untitled {index+1}</span>}
+        </span>
+        {device.meter_model&&(
+          <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.58rem",
+            color:CLR.text2(isDark) }}>
+            {profiles.find(p=>p.model===device.meter_model)?.display_name??device.meter_model}
+          </span>
+        )}
+        {selCount>0&&(
+          <span style={{ padding:"2px 8px",borderRadius:"12px",
+            background:accent+"20",border:`1px solid ${accent}44`,
+            color:accent,fontFamily:"'Share Tech Mono',monospace",
+            fontSize:"0.54rem",letterSpacing:"0.08em" }}>
+            {selCount} reg{selCount!==1?"s":""}
+          </span>
+        )}
+        <button onClick={e=>{e.stopPropagation();onRemove();}} style={{
+          background:"none",border:"none",color:CLR.red,cursor:"pointer",fontSize:"1rem",padding:"0 2px",opacity:0.65,
+        }}>✕</button>
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke={CLR.text3(isDark)} strokeWidth={2}
+          style={{ transform:expanded?"rotate(180deg)":"rotate(0)",transition:"transform 0.2s" }}>
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
+      </div>
+
+      {expanded&&(
+        <div style={{ padding:"14px" }}>
+          <div style={{ display:"grid",gridTemplateColumns:"2fr 2fr 1fr 1fr",
+            gap:"10px",marginBottom:"14px" }}>
+            <div>
+              <label style={lS}>Device Name</label>
+              <input type="text" value={device.device_name} placeholder='"Main Incomer"'
+                style={iS} onChange={e=>onUpdate({...device,device_name:e.target.value})}/>
+            </div>
+            <div>
+              <label style={lS}>Meter Model</label>
+              <select value={device.meter_model} style={{...iS,cursor:"pointer"}}
+                onChange={e=>handleModelChange(e.target.value)}>
+                <option value="" disabled>Select model…</option>
+                {profiles.map(p=><option key={p.model} value={p.model}>{p.display_name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={lS}>Slave ID</label>
+              <input type="number" min={1} max={247} value={device.slave_id}
+                style={{...iS,textAlign:"center"}}
+                onChange={e=>{const v=parseInt(e.target.value,10);if(v>=1&&v<=247)onUpdate({...device,slave_id:v});}}/>
+            </div>
+            <div>
+              {/* ← Seconds input: ×1000 before storing */}
+              <label style={lS}>Poll Rate (s)</label>
+              <input type="number" min={0.2} step={0.5} value={pollSecs}
+                style={{...iS,textAlign:"center"}}
+                onChange={e=>{
+                  const s=parseFloat(e.target.value);
+                  if(s>=0.2)onUpdate({...device,poll_rate_ms:Math.round(s*1000)});
+                }}/>
+            </div>
+          </div>
+
+          {device.meter_model&&(
+            <>
+              {/* Register search + select-all */}
+              <div style={{ display:"flex",alignItems:"center",gap:"8px",marginBottom:"8px" }}>
+                <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.52rem",
+                  letterSpacing:"0.16em",textTransform:"uppercase",color:CLR.text3(isDark) }}>
+                  Registers ({filtered.length+filteredCustom.length})
+                </span>
+                <input type="text" value={search} placeholder="Search…"
+                  onChange={e=>setSearch(e.target.value)}
+                  style={{...iS,flex:1,maxWidth:"150px",height:"26px",fontSize:"0.66rem"}}/>
+                <button onClick={()=>{
+                  if(allOn)setChecked(prev=>{const s=new Set(prev);allNames.forEach(n=>s.delete(n));return s;});
+                  else setChecked(prev=>new Set([...prev,...allNames]));
+                }} style={{
+                  padding:"0 10px",height:"26px",
+                  background:allOn?accent+"20":"transparent",
+                  border:`1px solid ${allOn?accent+"50":border}`,
+                  borderRadius:"5px",color:allOn?accent:CLR.text2(isDark),
+                  fontFamily:"'Rajdhani',sans-serif",fontWeight:600,
+                  fontSize:"0.68rem",letterSpacing:"0.06em",cursor:"pointer",whiteSpace:"nowrap",
+                }}>{allOn?"Deselect All":"Select All"}</button>
+              </div>
+
+              {/* Register list */}
+              <div style={{ border:`1px solid ${border}`,borderRadius:"6px",
+                maxHeight:"170px",overflowY:"auto",marginBottom:"12px",
+                background:isDark?"rgba(0,0,0,0.2)":"rgba(0,0,0,0.01)" }}>
+                {device.meter_model==="Custom" && filtered.length===0 && filteredCustom.length===0 && (
+                  <div style={{
+                    display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+                    padding:"20px 16px",gap:"6px",
+                  }}>
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none"
+                      stroke={CLR.amber} strokeWidth={1.5}>
+                      <circle cx="12" cy="12" r="10"/>
+                      <line x1="12" y1="8" x2="12" y2="12"/>
+                      <line x1="12" y1="16" x2="12.01" y2="16"/>
+                    </svg>
+                    <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.58rem",
+                      letterSpacing:"0.1em",color:CLR.amber,textAlign:"center",lineHeight:1.5 }}>
+                      Custom device — use "Add Custom Register"<br/>
+                      below to define your Modbus registers.
+                    </span>
+                  </div>
+                )}
+                {[...filtered.map(r=>({r,c:false})),...filteredCustom.map(r=>({r,c:true}))].map(({r,c})=>(
+                  <div key={r.name} onClick={()=>toggleReg(r.name)} style={{
+                    display:"flex",alignItems:"center",gap:"8px",padding:"5px 10px",
+                    borderBottom:`1px solid ${CLR.borderDim(isDark)}`,
+                    cursor:"pointer",userSelect:"none",
+                    background:checked.has(r.name)
+                      ?(isDark?"rgba(29,107,255,0.06)":"rgba(29,107,255,0.03)")
+                      :"transparent",
+                  }}>
+                    <div style={{
+                      width:"13px",height:"13px",borderRadius:"3px",flexShrink:0,
+                      background:checked.has(r.name)?accent:"transparent",
+                      border:`1.5px solid ${checked.has(r.name)?accent:CLR.border(isDark)}`,
+                      display:"flex",alignItems:"center",justifyContent:"center",
+                    }}>
+                      {checked.has(r.name)&&(
+                        <svg viewBox="0 0 10 10" width="9" height="9">
+                          <polyline points="1.5,5 4,7.5 8.5,2" stroke="#fff"
+                            strokeWidth="1.5" fill="none" strokeLinecap="round"/>
+                        </svg>
+                      )}
+                    </div>
+                    <span style={{ flex:1,fontFamily:"'Share Tech Mono',monospace",fontSize:"0.64rem",
+                      letterSpacing:"0.03em",
+                      color:checked.has(r.name)?CLR.text1(isDark):CLR.text2(isDark),
+                      overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>
+                      {r.name}
+                      {c&&<span style={{ marginLeft:"6px",padding:"1px 4px",borderRadius:"3px",
+                        background:CLR.green+"20",color:CLR.green,fontSize:"0.46rem",
+                        letterSpacing:"0.1em" }}>CUSTOM</span>}
+                    </span>
+                    <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.54rem",
+                      color:CLR.text3(isDark),minWidth:"40px",textAlign:"right" }}>@{r.address}</span>
+                    <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.52rem",
+                      color:CLR.text3(isDark),minWidth:"52px",textAlign:"center" }}>{r.data_type}</span>
+                    {c&&(
+                      <button onClick={e=>{e.stopPropagation();
+                        setCustomRegs(p=>p.filter(x=>x.name!==r.name));
+                        setChecked(p=>{const s=new Set(p);s.delete(r.name);return s;});
+                      }} style={{ background:"none",border:"none",color:CLR.red,cursor:"pointer",
+                        fontSize:"0.8rem",padding:"0 2px",lineHeight:1 }}>✕</button>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {/* Custom register builder */}
+              <div style={{ border:`1px solid ${border}`,borderRadius:"6px",overflow:"hidden" }}>
+                <div style={{ padding:"5px 12px",borderBottom:`1px solid ${border}`,
+                  background:isDark?"rgba(255,255,255,0.02)":"rgba(0,0,0,0.02)",
+                  fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",
+                  letterSpacing:"0.18em",textTransform:"uppercase",color:CLR.text3(isDark) }}>
+                  Add Custom Register
+                </div>
+                <div style={{ padding:"10px" }}>
+                  <div style={{ display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr auto",
+                    gap:"8px",alignItems:"end" }}>
+                    <div>
+                      <label style={lS}>Name</label>
+                      <input type="text" value={draft.name} placeholder="Tag name"
+                        style={{...iS,height:"28px",fontSize:"0.66rem"}}
+                        onChange={e=>{setDraft(d=>({...d,name:e.target.value}));setDraftErr(null);}}/>
+                    </div>
+                    <div>
+                      <label style={lS}>Address</label>
+                      <input type="number" min={0} max={65535} value={draft.address}
+                        style={{...iS,height:"28px",fontSize:"0.66rem"}}
+                        onChange={e=>setDraft(d=>({...d,address:e.target.value}))}/>
+                    </div>
+                    <div>
+                      <label style={lS}>Length</label>
+                      <select value={draft.length} style={{...iS,height:"28px",fontSize:"0.66rem",cursor:"pointer"}}
+                        onChange={e=>setDraft(d=>({...d,length:e.target.value}))}>
+                        <option value="1">1 (16b)</option>
+                        <option value="2">2 (32b)</option>
+                        <option value="4">4 (64b)</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label style={lS}>Type</label>
+                      <select value={draft.data_type} style={{...iS,height:"28px",fontSize:"0.66rem",cursor:"pointer"}}
+                        onChange={e=>setDraft(d=>({...d,data_type:e.target.value}))}>
+                        {DATA_TYPES.map(t=><option key={t} value={t}>{t}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label style={lS}>×Mult</label>
+                      <input type="text" value={draft.multiplier} placeholder="1.0"
+                        style={{...iS,height:"28px",fontSize:"0.66rem"}}
+                        onChange={e=>setDraft(d=>({...d,multiplier:e.target.value}))}/>
+                    </div>
+                    <button onClick={addCustom} style={{
+                      height:"28px",padding:"0 12px",borderRadius:"5px",
+                      background:CLR.blue+"20",border:`1px solid ${CLR.blue}50`,
+                      color:CLR.blue,cursor:"pointer",
+                      fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+                      fontSize:"0.7rem",letterSpacing:"0.08em",whiteSpace:"nowrap",
+                    }}>+ Add</button>
+                  </div>
+                  {draftErr&&(
+                    <div style={{ marginTop:"6px",fontFamily:"'Share Tech Mono',monospace",
+                      fontSize:"0.58rem",color:CLR.amber,letterSpacing:"0.06em" }}>
+                      ⚠ {draftErr}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── DeviceSetupModal ────────────────────────────────────────────────────────
+
+function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme }:{
+  profiles:MeterProfile[]; initialDevices:DeviceConfig[];
+  onSave:(devices:DeviceConfig[])=>void; onClose:()=>void; theme:Theme;
+}) {
+  const isDark = theme==="dark";
+  const [devices,setDevices] = useState<DeviceConfig[]>(()=>
+    initialDevices.length>0
+      ? initialDevices
+      : [{...DEFAULT_DEVICE(),meter_model:profiles[0]?.model??""}]
+  );
+  const updDevice = (i:number,d:DeviceConfig) => setDevices(p=>p.map((x,j)=>j===i?d:x));
+  const remDevice = (i:number) => setDevices(p=>p.length>1?p.filter((_,j)=>j!==i):p);
+  const addDevice = () => setDevices(p=>[...p,{...DEFAULT_DEVICE(),meter_model:profiles[0]?.model??""}]);
+
+  const handleSave = () => {
+    for(const d of devices){
+      if(!d.device_name.trim()){alert("A device is missing a name.");return;}
+      if(!d.meter_model){alert(`"${d.device_name}" — select a meter model.`);return;}
+      if(d.slave_id<1||d.slave_id>247){alert(`"${d.device_name}" — Slave ID must be 1–247.`);return;}
+      if(d.selected_registers.length===0){alert(`"${d.device_name}" — select at least one register.`);return;}
+    }
+    const ids=devices.map(d=>d.slave_id);
+    const dup=ids.find((id,i)=>ids.indexOf(id)!==i);
+    if(dup!==undefined){alert(`Duplicate Slave ID ${dup} — each device must have a unique address.`);return;}
+    onSave(devices);
+  };
+
+  const totalRegs = devices.reduce((s,d)=>s+d.selected_registers.length,0);
+  const border    = CLR.border(isDark);
+
+  return (
+    <div style={{
+      position:"fixed",inset:0,zIndex:9998,
+      background:"rgba(0,0,0,0.78)",backdropFilter:"blur(6px)",
+      display:"flex",alignItems:"center",justifyContent:"center",padding:"20px",
+    }} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div style={{
+        width:"100%",maxWidth:"880px",maxHeight:"92vh",
+        ...glass(isDark),
+        boxShadow:"0 40px 100px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.08)",
+        display:"flex",flexDirection:"column",overflow:"hidden",
+      }}>
+        <div style={{ height:"3px",
+          background:"linear-gradient(90deg,#1d6bff,#16a34a,#d97706,#7c3aed)" }}/>
+
+        <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",
+          padding:"14px 20px 10px",borderBottom:`1px solid ${border}`,flexShrink:0 }}>
+          <div>
+            <div style={{ fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:"1.05rem",
+              letterSpacing:"0.08em",color:CLR.text1(isDark) }}>Bus Configuration</div>
+            <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.52rem",
+              letterSpacing:"0.14em",color:CLR.text3(isDark),marginTop:"2px" }}>
+              {devices.length} device{devices.length!==1?"s":""} · {totalRegs} registers · poll rate in seconds
+            </div>
+          </div>
+          <button onClick={onClose} style={{
+            background:"none",border:`1px solid ${border}`,borderRadius:"5px",
+            color:CLR.text2(isDark),cursor:"pointer",padding:"4px 10px",
+            fontFamily:"'Share Tech Mono',monospace",fontSize:"0.58rem",letterSpacing:"0.08em",
+          }}>ESC</button>
+        </div>
+
+        <div style={{ flex:1,overflowY:"auto",padding:"14px 20px" }}>
+          {devices.map((dev,i)=>(
+            <DevicePanel key={i} index={i} device={dev} profiles={profiles} isDark={isDark}
+              onUpdate={d=>updDevice(i,d)} onRemove={()=>remDevice(i)}/>
+          ))}
+          <button onClick={addDevice} style={{
+            width:"100%",padding:"10px",
+            background:"transparent",
+            border:`1px dashed ${isDark?CLR.blue+"40":CLR.blue+"30"}`,
+            borderRadius:"8px",color:CLR.text3(isDark),
+            fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+            fontSize:"0.72rem",letterSpacing:"0.12em",textTransform:"uppercase",
+            cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:"8px",
+          }}
+            onMouseEnter={e=>{(e.currentTarget as HTMLElement).style.borderColor=CLR.blue+"80";
+              (e.currentTarget as HTMLElement).style.color=CLR.blue;}}
+            onMouseLeave={e=>{(e.currentTarget as HTMLElement).style.borderColor=isDark?CLR.blue+"40":CLR.blue+"30";
+              (e.currentTarget as HTMLElement).style.color=CLR.text3(isDark);}}>
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth={2.5}>
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+            Add Another Meter
+          </button>
+        </div>
+
+        <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",
+          padding:"10px 20px",borderTop:`1px solid ${border}`,flexShrink:0 }}>
+          <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.54rem",
+            letterSpacing:"0.1em",color:CLR.text3(isDark) }}>
+            {totalRegs} register{totalRegs!==1?"s":""} across {devices.length} device{devices.length!==1?"s":""}
+          </span>
+          <div style={{ display:"flex",gap:"10px" }}>
+            <button onClick={onClose} style={{
+              padding:"0 16px",height:"34px",borderRadius:"6px",
+              background:"transparent",border:`1px solid ${border}`,
+              color:CLR.text2(isDark),cursor:"pointer",
+              fontFamily:"'Rajdhani',sans-serif",fontWeight:600,fontSize:"0.78rem",
+            }}>Cancel</button>
+            <button onClick={handleSave} disabled={totalRegs===0} style={{
+              padding:"0 20px",height:"34px",borderRadius:"6px",
+              background:totalRegs===0?"rgba(29,107,255,0.1)":"#1d6bff",
+              border:`1px solid ${totalRegs===0?CLR.blue+"30":"#1d6bff"}`,
+              color:totalRegs===0?CLR.text3(isDark):"#fff",
+              cursor:totalRegs===0?"not-allowed":"pointer",
+              fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:"0.8rem",
+              letterSpacing:"0.08em",
+              boxShadow:totalRegs>0?"0 4px 14px rgba(29,107,255,0.4)":"none",
+            }}>Save Bus Configuration</button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
 
 // ─── License Gateway ──────────────────────────────────────────────────────────
 
-function LicenseGateway({ onActivated }: { onActivated: (auth: AuthState) => void }) {
-  const [licenseKey, setLicenseKey] = useState("");
-  const [username,   setUsername]   = useState("");
-  const [projectName,setProjectName]= useState("");
-  const [error,      setError]      = useState<string|null>(null);
-  const [activating, setActivating] = useState(false);
-  const [focused,    setFocused]    = useState<string|null>(null);
+function LicenseGateway({ onActivated }:{ onActivated:(auth:AuthState)=>void }) {
+  const [key,      setKey]      = useState("");
+  const [username, setUsername] = useState("");
+  const [project,  setProject]  = useState("");
+  const [error,    setError]    = useState<string|null>(null);
+  const [busy,     setBusy]     = useState(false);
+  const [focused,  setFocused]  = useState<string|null>(null);
 
-  const handleActivate = async () => {
+  const activate = async () => {
     setError(null);
-    if (!licenseKey.trim() || !username.trim() || !projectName.trim()) { setError("All fields are required."); return; }
-    setActivating(true);
+    if(!key.trim())     {setError("License key is required.");return;}
+    if(!username.trim()){setError("Username is required.");return;}
+    if(!project.trim()) {setError("Project name is required.");return;}
+    setBusy(true);
     try {
-      await invoke<string>("activate_license", { key:licenseKey.trim(), username:username.trim(), projectName:projectName.trim() });
+      await invoke<string>("activate_license",{key:key.trim(),username:username.trim(),projectName:project.trim()});
       const auth = await invoke<AuthState>("get_auth_state");
       onActivated(auth);
-    } catch(err) { setError(String(err)); }
-    finally { setActivating(false); }
+    } catch(e) { setError(String(e)); }
+    finally { setBusy(false); }
   };
 
-  const inp = (field:string): React.CSSProperties => ({
-    width:"100%", padding:"11px 14px", background:"rgba(255,255,255,0.04)",
-    border:`1px solid ${focused===field ? "rgba(34,68,240,0.7)" : "rgba(255,255,255,0.1)"}`,
-    borderRadius:"7px", color:"#e2e8f0", fontFamily: field==="key" ? "'Share Tech Mono',monospace" : "'Rajdhani',sans-serif",
-    fontSize: field==="key" ? "0.72rem" : "0.95rem", fontWeight: field==="key" ? 400 : 600,
-    letterSpacing: field==="key" ? "0.06em" : "0.04em", outline:"none",
-    boxShadow: focused===field ? "0 0 0 3px rgba(34,68,240,0.15)" : "none", transition:"all 0.2s ease",
+  const iS = (f:string): React.CSSProperties => ({
+    width:"100%",padding:"10px 12px",
+    background:"rgba(255,255,255,0.06)",
+    border:`1px solid ${focused===f?"rgba(29,107,255,0.7)":"rgba(255,255,255,0.12)"}`,
+    borderRadius:"7px",color:"#e6edf3",outline:"none",
+    fontFamily:f==="key"?"'Share Tech Mono',monospace":"'Rajdhani',sans-serif",
+    fontSize:f==="key"?"0.72rem":"0.92rem",fontWeight:f==="key"?400:600,
+    letterSpacing:f==="key"?"0.06em":"0.04em",
+    boxShadow:focused===f?"0 0 0 3px rgba(29,107,255,0.18)":"none",
+    transition:"all 0.2s ease",
   });
 
   return (
-    <div style={{ position:"fixed", inset:0, background:"#050608", backgroundImage:"radial-gradient(circle, rgba(26,31,42,0.8) 1px, transparent 1px)", backgroundSize:"28px 28px", display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999 }}>
-      <div style={{ width:"100%", maxWidth:460, background:"linear-gradient(145deg,#0f1318,#0a0c0f)", border:"1px solid rgba(255,255,255,0.07)", borderRadius:"14px", boxShadow:"0 24px 80px rgba(0,0,0,0.8)", overflow:"hidden" }}>
-        <div style={{ height:"2px", background:"linear-gradient(90deg,transparent,#2244F0,#00e5a0,transparent)" }} />
-        <div style={{ padding:"36px 36px 32px" }}>
-          <div style={{ textAlign:"center", marginBottom:"32px" }}>
-            <div style={{ width:48, height:48, margin:"0 auto 14px", background:"rgba(34,68,240,0.12)", border:"1px solid rgba(34,68,240,0.3)", borderRadius:"11px", display:"flex", alignItems:"center", justifyContent:"center" }}>
-              <svg viewBox="0 0 24 24" width="20" height="20" fill="#2244F0"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+    <div style={{
+      position:"fixed",inset:0,background:"#0f1117",
+      backgroundImage:"radial-gradient(circle,rgba(30,36,48,0.9) 1px,transparent 1px)",
+      backgroundSize:"24px 24px",
+      display:"flex",alignItems:"center",justifyContent:"center",zIndex:9999,
+    }}>
+      <div style={{
+        width:"100%",maxWidth:440,
+        background:"#161b22",border:"1px solid #30363d",
+        borderRadius:"12px",boxShadow:"0 24px 80px rgba(0,0,0,0.8)",overflow:"hidden",
+      }}>
+        <div style={{ height:"3px",
+          background:"linear-gradient(90deg,#1d6bff,#16a34a,#d97706)" }}/>
+        <div style={{ padding:"32px" }}>
+          <div style={{ textAlign:"center",marginBottom:"28px" }}>
+            <div style={{ width:44,height:44,margin:"0 auto 12px",
+              background:"#1d6bff",borderRadius:"10px",
+              display:"flex",alignItems:"center",justifyContent:"center" }}>
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="white">
+                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+              </svg>
             </div>
-            <div style={{ fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:"1.5rem", letterSpacing:"0.08em", color:"#e2e8f0" }}>TechniDAQ</div>
-            <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.55rem", letterSpacing:"0.2em", color:"#2a3550", textTransform:"uppercase", marginTop:"4px" }}>License Activation · AES-256-GCM</div>
+            <div style={{ fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:"1.4rem",
+              letterSpacing:"0.06em",color:"#e6edf3" }}>TechniDAQ</div>
+            <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.52rem",
+              letterSpacing:"0.2em",color:"#484f58",marginTop:"3px" }}>
+              LICENSE ACTIVATION
+            </div>
           </div>
-          <div style={{ display:"flex", flexDirection:"column", gap:"16px" }}>
-            <div><div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.52rem", letterSpacing:"0.22em", color:"#4a5c7a", textTransform:"uppercase", marginBottom:"6px" }}>License Key</div><textarea value={licenseKey} rows={3} placeholder="Paste your license key here…" style={{ ...inp("key"), resize:"none", lineHeight:1.6 }} onChange={e => { setLicenseKey(e.target.value); setError(null); }} onFocus={() => setFocused("key")} onBlur={() => setFocused(null)} onKeyDown={e => { if (e.key==="Enter" && !e.shiftKey) { e.preventDefault(); handleActivate(); } }} /></div>
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"12px" }}>
-              {[["user","Username","username","john.smith"],["proj","Project","projectName","Site Alpha"]].map(([f,label,_,ph]) => (
-                <div key={f}><div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.52rem", letterSpacing:"0.22em", color:"#4a5c7a", textTransform:"uppercase", marginBottom:"6px" }}>{label}</div><input type="text" placeholder={`e.g. ${ph}`} style={inp(f)} value={f==="user" ? username : projectName} onChange={e => { f==="user" ? setUsername(e.target.value) : setProjectName(e.target.value); setError(null); }} onFocus={() => setFocused(f)} onBlur={() => setFocused(null)} onKeyDown={e => { if (e.key==="Enter") handleActivate(); }} /></div>
+          <div style={{ display:"flex",flexDirection:"column",gap:"14px" }}>
+            <div>
+              <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",
+                letterSpacing:"0.2em",color:"#484f58",textTransform:"uppercase",marginBottom:"6px" }}>
+                License Key
+              </div>
+              <textarea rows={3} value={key} placeholder="Paste your license key…"
+                style={{ ...iS("key"),resize:"none",lineHeight:1.6 }}
+                onChange={e=>{setKey(e.target.value);setError(null);}}
+                onFocus={()=>setFocused("key")} onBlur={()=>setFocused(null)}
+                onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();activate();}}}/>
+            </div>
+            <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px" }}>
+              {(["user","proj"] as const).map(f=>(
+                <div key={f}>
+                  <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",
+                    letterSpacing:"0.2em",color:"#484f58",textTransform:"uppercase",marginBottom:"6px" }}>
+                    {f==="user"?"Username":"Project"}
+                  </div>
+                  <input type="text"
+                    placeholder={f==="user"?"john.smith":"Site Alpha"}
+                    style={iS(f)}
+                    value={f==="user"?username:project}
+                    onChange={e=>{f==="user"?setUsername(e.target.value):setProject(e.target.value);setError(null);}}
+                    onFocus={()=>setFocused(f)} onBlur={()=>setFocused(null)}
+                    onKeyDown={e=>{if(e.key==="Enter")activate();}}/>
+                </div>
               ))}
             </div>
-            {error && <div style={{ display:"flex", gap:"8px", alignItems:"flex-start", padding:"10px 12px", background:"rgba(249,115,22,0.08)", border:"1px solid rgba(249,115,22,0.3)", borderRadius:"7px" }}><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="#f97316" strokeWidth={2.5} style={{ flexShrink:0, marginTop:1 }}><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.66rem", color:"#fb923c", letterSpacing:"0.04em", lineHeight:1.5 }}>{error}</span></div>}
-            <button onClick={handleActivate} disabled={activating} style={{ padding:"12px", background: activating ? "rgba(34,68,240,0.15)" : "linear-gradient(135deg,#1635D4,#2244F0)", border:"1px solid rgba(34,68,240,0.5)", borderRadius:"7px", color: activating ? "#4a5c7a" : "#fff", fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:"0.85rem", letterSpacing:"0.14em", textTransform:"uppercase", cursor: activating ? "not-allowed":"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:"8px", boxShadow: activating ? "none" : "0 4px 18px rgba(34,68,240,0.35)" }}>{activating ? "Activating…" : "Activate License"}</button>
+            {error&&(
+              <div style={{ padding:"10px 12px",
+                background:"rgba(220,38,38,0.1)",border:"1px solid rgba(220,38,38,0.3)",
+                borderRadius:"7px",fontFamily:"'Share Tech Mono',monospace",
+                fontSize:"0.64rem",color:"#f87171",letterSpacing:"0.04em",lineHeight:1.5 }}>
+                ⚠ {error}
+              </div>
+            )}
+            <button onClick={activate} disabled={busy} style={{
+              padding:"11px",
+              background:busy?"rgba(29,107,255,0.15)":"#1d6bff",
+              border:`1px solid ${busy?"rgba(29,107,255,0.3)":"#1d6bff"}`,
+              borderRadius:"7px",
+              color:busy?"#484f58":"#fff",
+              fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+              fontSize:"0.85rem",letterSpacing:"0.14em",textTransform:"uppercase",
+              cursor:busy?"not-allowed":"pointer",
+              boxShadow:busy?"none":"0 4px 18px rgba(29,107,255,0.4)",
+            }}>{busy?"Activating…":"Activate License"}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── LogoutModal ──────────────────────────────────────────────────────────────
+
+function LogoutModal({ username, projectName, onConfirm, onClose, theme, busy }:{
+  username:string; projectName:string;
+  onConfirm:()=>void; onClose:()=>void; theme:Theme; busy:boolean;
+}) {
+  const isDark = theme === "dark";
+  const [inputUser, setInputUser] = useState("");
+  const [inputProj, setInputProj] = useState("");
+  const confirmed = inputUser === username && inputProj === projectName;
+
+  const border = CLR.border(isDark);
+  const iS: React.CSSProperties = {
+    width:"100%", padding:"8px 10px",
+    background:isDark?"rgba(255,255,255,0.05)":"#f6f8fa",
+    border:`1px solid ${border}`, borderRadius:"6px",
+    color:CLR.text1(isDark), outline:"none",
+    fontFamily:"'Share Tech Mono',monospace",
+    fontSize:"0.75rem", letterSpacing:"0.04em",
+  };
+  const lS: React.CSSProperties = {
+    display:"block", marginBottom:"5px",
+    fontFamily:"'Share Tech Mono',monospace", fontSize:"0.5rem",
+    letterSpacing:"0.2em", textTransform:"uppercase", color:CLR.text3(isDark),
+  };
+
+  return (
+    <div style={{
+      position:"fixed", inset:0, zIndex:9999,
+      background:"rgba(0,0,0,0.82)", backdropFilter:"blur(6px)",
+      display:"flex", alignItems:"center", justifyContent:"center", padding:"20px",
+    }} onClick={e=>{ if(e.target===e.currentTarget) onClose(); }}>
+      <div style={{
+        width:"100%", maxWidth:"420px",
+        ...glass(isDark),
+        boxShadow:"0 40px 100px rgba(0,0,0,0.6), 0 0 0 1px rgba(220,38,38,0.2)",
+        overflow:"hidden",
+      }}>
+        {/* Red danger stripe */}
+        <div style={{ height:"3px", background:"linear-gradient(90deg,#ef4444,#dc2626,#b91c1c)" }}/>
+
+        <div style={{ padding:"24px" }}>
+          {/* Icon + title */}
+          <div style={{ display:"flex", alignItems:"center", gap:"12px", marginBottom:"16px" }}>
+            <div style={{
+              width:"38px", height:"38px", borderRadius:"8px", flexShrink:0,
+              background:"rgba(239,68,68,0.12)", border:"1px solid rgba(239,68,68,0.25)",
+              display:"flex", alignItems:"center", justifyContent:"center",
+            }}>
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none"
+                stroke={CLR.red} strokeWidth={2}>
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                <polyline points="16 17 21 12 16 7"/>
+                <line x1="21" y1="12" x2="9" y2="12"/>
+              </svg>
+            </div>
+            <div>
+              <div style={{ fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:"1rem",
+                letterSpacing:"0.06em", color:CLR.text1(isDark) }}>Revoke License &amp; Log Out</div>
+              <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.54rem",
+                letterSpacing:"0.1em", color:CLR.text3(isDark), marginTop:"2px" }}>
+                History data will be preserved
+              </div>
+            </div>
+          </div>
+
+          {/* Warning box */}
+          <div style={{
+            padding:"10px 12px", marginBottom:"18px",
+            background:"rgba(239,68,68,0.08)", border:"1px solid rgba(239,68,68,0.2)",
+            borderRadius:"6px", fontFamily:"'Share Tech Mono',monospace",
+            fontSize:"0.6rem", color:CLR.red, letterSpacing:"0.04em", lineHeight:1.6,
+          }}>
+            To confirm, type your <strong>username</strong> and <strong>project name</strong> exactly as they appear on your license.
+          </div>
+
+          <div style={{ display:"flex", flexDirection:"column", gap:"12px", marginBottom:"20px" }}>
+            <div>
+              <label style={lS}>Username</label>
+              <input type="text" value={inputUser} placeholder={username}
+                style={iS} onChange={e=>setInputUser(e.target.value)}/>
+            </div>
+            <div>
+              <label style={lS}>Project Name</label>
+              <input type="text" value={inputProj} placeholder={projectName}
+                style={iS} onChange={e=>setInputProj(e.target.value)}
+                onKeyDown={e=>{ if(e.key==="Enter" && confirmed && !busy) onConfirm(); }}/>
+            </div>
+          </div>
+
+          <div style={{ display:"flex", gap:"10px" }}>
+            <button onClick={onClose} disabled={busy} style={{
+              flex:1, padding:"0 16px", height:"36px", borderRadius:"6px",
+              background:"transparent", border:`1px solid ${border}`,
+              color:CLR.text2(isDark), cursor:busy?"not-allowed":"pointer",
+              fontFamily:"'Rajdhani',sans-serif", fontWeight:600, fontSize:"0.78rem",
+            }}>Cancel</button>
+            <button onClick={onConfirm} disabled={!confirmed || busy} style={{
+              flex:1, padding:"0 16px", height:"36px", borderRadius:"6px",
+              background: confirmed && !busy ? CLR.red : "rgba(239,68,68,0.1)",
+              border:`1px solid ${confirmed && !busy ? CLR.red : "rgba(239,68,68,0.2)"}`,
+              color: confirmed && !busy ? "#fff" : "rgba(239,68,68,0.4)",
+              cursor: confirmed && !busy ? "pointer" : "not-allowed",
+              fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:"0.78rem",
+              letterSpacing:"0.08em",
+              boxShadow: confirmed && !busy ? "0 4px 14px rgba(239,68,68,0.35)" : "none",
+              transition:"all 0.15s ease",
+            }}>{busy ? "Logging out…" : "Confirm Logout"}</button>
           </div>
         </div>
       </div>
@@ -424,247 +1640,17 @@ function LicenseGateway({ onActivated }: { onActivated: (auth: AuthState) => voi
 
 function AuthLoadingScreen() {
   return (
-    <div style={{ position:"fixed",inset:0,background:"#050608",display:"flex",flexDirection:"column", alignItems:"center",justifyContent:"center",gap:"16px",zIndex:9999 }}>
-      <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="#2244F0" strokeWidth={2} style={{ animation:"spin 1s linear infinite", opacity:0.7 }}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
-      <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.58rem", letterSpacing:"0.28em", color:"#2a3550", textTransform:"uppercase" }}>Verifying License…</span>
-    </div>
-  );
-}
-
-// ─── Header ───────────────────────────────────────────────────────────────────
-
-function Header({ pollState, latestReading, theme, onThemeToggle, onTogglePoll,
-  onClear, onExport, exportStatus, comPort, onComPortChange, username, projectName, activeDevice,
-  onOpenModal // <-- New function to open setup modal
-}: {
-  pollState: PollState; latestReading: MeterReading | null; theme: Theme;
-  onThemeToggle: () => void; onTogglePoll: () => void;
-  onClear: () => void; onExport: () => void; exportStatus: ExportStatus;
-  comPort: string; onComPortChange: (v:string) => void;
-  username: string; projectName: string; activeDevice: ActiveDevice | null;
-  onOpenModal: () => void;
-}) {
-  const isPolling = pollState === "running" || pollState === "fault";
-  const isDark    = theme === "dark";
-  const btnBorder = isDark ? "rgba(255,255,255,0.06)" : "rgba(22,53,212,0.1)";
-  const textDim   = isDark ? "#4a5c7a"                : "#8fa0cc";
-
-  const timeStr = latestReading
-    ? new Date(latestReading.timestamp_ms).toLocaleTimeString("en-GB", { hour12:false })
-    : "--:--:--";
-
-  const freq = latestReading
-    ? Object.entries(latestReading.data).find(([k]) => k.toLowerCase().includes("frequen"))?.[1]
-    : undefined;
-
-  const statusConfig = {
-    running: { label:"LIVE",    ledClass:"status-led-running", textClass:"status-text-online"  },
-    stopped: { label:"STOPPED", ledClass:"status-led-stopped", textClass:"status-text-stopped" },
-    fault:   { label:"FAULT",   ledClass:"status-led-fault",   textClass:"status-text-fault"   },
-  }[pollState];
-
-  const deviceLine = activeDevice
-    ? `${activeDevice.profile.display_name.toUpperCase()} · RS485 · MODBUS RTU`
-    : "UNIVERSAL SCADA PLATFORM";
-
-  const exportLabel = { idle:"Export Excel", saving:"Saving…", success:"Exported!", error:"Failed" }[exportStatus];
-
-  return (
-    <header className="app-header">
-      <div className="header-brand">
-        <div className="logo-fallback" style={{ display:"flex" }}>
-          <svg viewBox="0 0 24 24" className="logo-bolt" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-        </div>
-        <div className="brand-text">
-          <div className="brand-name">TechniDAQ</div>
-          <div className="brand-sub">by Technicat Group</div>
-        </div>
-      </div>
-
-      <div className="header-center">
-        <div className="device-info-primary">{deviceLine}</div>
-        
-        <div className="header-com-row">
-          {/* Replaced the old full-width horizontal bar with this clean inline button */}
-          <button
-            onClick={onOpenModal}
-            disabled={isPolling}
-            style={{
-              display:"flex", alignItems:"center", gap:"6px",
-              padding:"4px 10px",
-              background: isPolling ? "transparent" : (isDark ? "rgba(34,68,240,0.12)" : "rgba(22,53,212,0.07)"),
-              border:`1px solid ${isPolling ? btnBorder : (isDark ? "rgba(34,68,240,0.4)" : "rgba(22,53,212,0.3)")}`,
-              borderRadius:"6px",
-              color: isPolling ? textDim : (isDark ? "#6b8fff" : "#1635D4"),
-              fontFamily:"'Rajdhani',sans-serif", fontWeight:700,
-              fontSize:"0.65rem", letterSpacing:"0.1em", textTransform:"uppercase",
-              cursor: isPolling ? "not-allowed" : "pointer",
-              opacity: isPolling ? 0.6 : 1,
-              transition:"all 0.15s ease",
-            }}
-          >
-            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth={2.5}>
-              <circle cx="12" cy="12" r="3"/>
-              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-            </svg>
-            Configure
-          </button>
-
-          <div className="header-com-divider" />
-
-          <div className="device-info-secondary">
-            {activeDevice
-              ? `SLAVE ${String(activeDevice.slaveId).padStart(2,"0")} · ${activeDevice.profile.baud_rate} BAUD · ${activeDevice.selectedRegisters.length} REGISTERS`
-              : "No device configured"
-            }
-          </div>
-          <div className="header-com-divider" />
-          <ComPortSelector value={comPort} onChange={onComPortChange} disabled={isPolling} />
-        </div>
-
-        {(projectName || username) && (
-          <div style={{ display:"flex", alignItems:"center", gap:"8px", marginTop:"2px" }}>
-            {projectName && <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.55rem", letterSpacing:"0.16em", color:"#2244F0", textTransform:"uppercase" }}>⬡ {projectName}</span>}
-            {username && <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.55rem", letterSpacing:"0.16em", color:"#4a5c7a", textTransform:"uppercase" }}>· {username}</span>}
-          </div>
-        )}
-      </div>
-
-      <div className="header-right">
-        {freq !== undefined && (
-          <>
-            <div className="header-stat">
-              <span className="header-stat-label">FREQUENCY</span>
-              <span className="header-stat-value">{freq.toFixed(2)} <span className="header-stat-unit">Hz</span></span>
-            </div>
-            <div className="header-divider" />
-          </>
-        )}
-        <div className="header-stat">
-          <span className="header-stat-label">LAST POLL</span>
-          <span className="header-stat-value">{timeStr}</span>
-        </div>
-        <div className="header-divider" />
-        <div className="header-status">
-          <span className={`status-led ${statusConfig.ledClass}`} />
-          <span className={`status-label ${statusConfig.textClass}`}>{statusConfig.label}</span>
-        </div>
-        <div className="header-divider" />
-        <div className="header-controls">
-          <button className={`ctrl-btn poll-btn-${pollState}`} onClick={onTogglePoll}>
-            {isPolling
-              ? <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
-              : <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
-            }
-            <span>{pollState === "running" ? "Stop" : pollState === "fault" ? "Reset" : "Start"}</span>
-          </button>
-          <button className="ctrl-btn clear-btn" onClick={onClear}>
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2}>
-              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-              <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
-            </svg>
-            <span>Clear</span>
-          </button>
-          <button className={`ctrl-btn export-btn export-btn-${exportStatus}`} onClick={onExport} disabled={exportStatus === "saving"}>
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2}>
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-            </svg>
-            <span>{exportLabel}</span>
-          </button>
-          <button className="ctrl-btn theme-toggle" onClick={onThemeToggle}>
-            {theme === "dark"
-              ? <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2}><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/></svg>
-              : <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2}><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-            }
-            <span>{theme === "dark" ? "Light" : "Dark"}</span>
-          </button>
-        </div>
-      </div>
-    </header>
-  );
-}
-
-// ─── Chart ────────────────────────────────────────────────────────────────────
-
-interface ChartPoint { time: string;[key: string]: string | number }
-
-function ChartSection({ history, chartKeys, theme, pollState }: {
-  history:    ChartPoint[];
-  chartKeys:  string[];
-  theme:      Theme;
-  pollState:  PollState;
-}) {
-  const isDark     = theme === "dark";
-  const isStopped  = pollState === "stopped";
-  const gridColor  = isDark ? "rgba(255,255,255,0.04)" : "rgba(21,53,212,0.06)";
-  const axisColor  = isDark ? "#2a3550" : "#c7d4ee";
-  const tickColor  = isDark ? "#4a5c7a" : "#8fa3c8";
-  const lineColors =["#2d5ff5","#00d4ff","#f59e0b","#34d399","#c084fc"];
-
-  const key0 = chartKeys[0];
-  const key1 = chartKeys[1];
-
-  return (
-    <div className="chart-card">
-      <div className="chart-card-header">
-        <div className="chart-card-title-row">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke={lineColors[0]} strokeWidth={2.5} style={{ flexShrink:0 }}>
-            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-          </svg>
-          <span className="chart-card-title">REAL-TIME WAVEFORM</span>
-          <div className="chart-title-accent" style={{ background:`linear-gradient(90deg,${lineColors[0]},${lineColors[1]})` }} />
-        </div>
-        <div className="chart-card-meta">
-          <span className="chart-window-label">WINDOW</span>
-          <span className="chart-window-value">{history.length} / {MAX_HISTORY} s</span>
-        </div>
-      </div>
-
-      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"6px 20px 0", gap:"12px" }}>
-        <div style={{ display:"flex", alignItems:"center", gap:"12px" }}>
-          {chartKeys.slice(0,2).map((k,i) => (
-            <div key={k} style={{ display:"flex", alignItems:"center", gap:"6px" }}>
-              <div style={{ width:"8px", height:"8px", borderRadius:"50%", background:lineColors[i], boxShadow:`0 0 6px ${lineColors[i]}80` }} />
-              <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.6rem", color:isDark?"#8fa3c8":"#4a64a8", letterSpacing:"0.08em" }}>{k}</span>
-            </div>
-          ))}
-        </div>
-        <span className={`chart-live-badge ${isStopped?"chart-live-badge-stopped":""}`}
-          style={{
-            borderColor: isStopped ? "rgba(148,163,184,0.25)" : (isDark?"rgba(0,212,255,0.3)":"rgba(21,53,212,0.2)"),
-            color: isStopped ? (isDark?"#4a5c7a":"#94a3b8") : (isDark?"#00d4ff":"#1535d4"),
-          }}>
-          <span className="chart-live-dot" style={{ background: isStopped ? "#4a5c7a" : (isDark?"#00d4ff":"#1535d4"), animationPlayState: isStopped ? "paused":"running" }}/>
-          {isStopped ? "PAUSED" : "LIVE"}
-        </span>
-      </div>
-
-      <div className="chart-area">
-        {history.length === 0 ? (
-          <div className="chart-empty">
-            <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke={tickColor} strokeWidth={1.5}>
-              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-            </svg>
-            <span style={{ color:tickColor, fontFamily:"'Share Tech Mono',monospace", fontSize:"0.7rem", letterSpacing:"0.2em" }}>
-              {isStopped ? "POLLING STOPPED" : chartKeys.length === 0 ? "NO REGISTERS SELECTED" : "AWAITING DATA…"}
-            </span>
-          </div>
-        ) : (
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={history} margin={{ top:8, right:16, left:0, bottom:0 }}>
-              <CartesianGrid stroke={gridColor} strokeDasharray="4 4" vertical={false} />
-              <XAxis dataKey="time" tick={{ fontFamily:"'Share Tech Mono',monospace", fontSize:10, fill:tickColor }} axisLine={{ stroke:axisColor }} tickLine={false} interval="preserveStartEnd" minTickGap={60} />
-              {key0 && <YAxis yAxisId="l" orientation="left" tick={{ fontFamily:"'Share Tech Mono',monospace", fontSize:10, fill:lineColors[0] }} axisLine={false} tickLine={false} width={52} tickFormatter={v => v.toFixed(1)} />}
-              {key1 && <YAxis yAxisId="r" orientation="right" tick={{ fontFamily:"'Share Tech Mono',monospace", fontSize:10, fill:lineColors[1] }} axisLine={false} tickLine={false} width={52} tickFormatter={v => v.toFixed(2)} />}
-              <Tooltip contentStyle={{ background: isDark ? "rgba(8,12,24,0.97)" : "rgba(255,255,255,0.97)", border: `1px solid ${isDark?"rgba(45,95,245,0.3)":"rgba(21,53,212,0.15)"}`, borderRadius:"8px", padding:"10px 14px", fontFamily:"'Share Tech Mono',monospace", fontSize:"0.65rem" }} cursor={{ stroke:"rgba(255,255,255,0.06)", strokeWidth:1, strokeDasharray:"4 4" }} />
-              <Legend wrapperStyle={{ display:"none" }} />
-              {key0 && <Line yAxisId="l" type="monotone" dataKey={key0} stroke={lineColors[0]} strokeWidth={2} dot={false} activeDot={{ r:4, fill:lineColors[0] }} isAnimationActive={false} />}
-              {key1 && <Line yAxisId="r" type="monotone" dataKey={key1} stroke={lineColors[1]} strokeWidth={2} dot={false} activeDot={{ r:4, fill:lineColors[1] }} isAnimationActive={false} />}
-            </LineChart>
-          </ResponsiveContainer>
-        )}
-      </div>
+    <div style={{ position:"fixed",inset:0,background:"#0f1117",
+      display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+      gap:"14px",zIndex:9999 }}>
+      <div style={{ width:"28px",height:"28px",border:"2px solid #30363d",
+        borderTop:`2px solid ${CLR.blue}`,borderRadius:"50%",
+        animation:"spin 0.8s linear infinite" }}/>
+      <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.56rem",
+        letterSpacing:"0.28em",color:"#484f58",textTransform:"uppercase" }}>
+        Verifying License…
+      </span>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
     </div>
   );
 }
@@ -672,227 +1658,437 @@ function ChartSection({ history, chartKeys, theme, pollState }: {
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [authState,     setAuthState]     = useState<AuthState | null>(null);
-  const[checkingAuth,  setCheckingAuth]  = useState(true);
-  const [profiles,      setProfiles]      = useState<MeterProfile[]>([]);
-  const [activeDevice,  setActiveDevice]  = useState<ActiveDevice | null>(null);
-  const [showModal,     setShowModal]     = useState(false);
-  const [latestReading, setLatestReading] = useState<MeterReading | null>(null);
-  const[history,       setHistory]       = useState<ChartPoint[]>([]);
-  const[pollState,     setPollState]     = useState<PollState>("stopped");
-  const [theme,         setTheme]         = useState<Theme>("dark");
-  const [exportStatus,  setExportStatus]  = useState<ExportStatus>("idle");
-  const [comPort,       setComPort]       = useState("COM3");
-  const[toast,         setToast]         = useState<ToastState>({ message:"", type:"success", visible:false });
+  const [authState,         setAuthState]         = useState<AuthState|null>(null);
+  const [checkingAuth,      setCheckingAuth]       = useState(true);
+  const [profiles,          setProfiles]           = useState<MeterProfile[]>([]);
+  const [configuredDevices, setConfiguredDevices]  = useState<DeviceConfig[]>([]);
+  const [showModal,         setShowModal]          = useState(false);
+  const [showLogout,        setShowLogout]         = useState(false);
+  const [logoutBusy,        setLogoutBusy]         = useState(false);
+  const [timeRange,         setTimeRange]          = useState<number|null>(null);
+  const [activeTab,         setActiveTab]          = useState<string>("");
+  // latestByDevice: device_name → MeterReading
+  const [latestByDevice,    setLatestByDevice]     = useState<Record<string,MeterReading>>({});
+  // historyByDevice: device_name → ChartPoint[]
+  const [historyByDevice,   setHistoryByDevice]    = useState<Record<string,ChartPoint[]>>({});
+  const [lastPollMs,        setLastPollMs]         = useState(0);
+  const [pollState,         setPollState]          = useState<PollState>("stopped");
+  const [theme,             setTheme]              = useState<Theme>("dark");
+  const [exportStatus,      setExportStatus]       = useState<ExportStatus>("idle");
+  const [comPort,           setComPort]            = useState("COM3");
+  const [toast,             setToast]              = useState<ToastState>(
+    {message:"",type:"success",visible:false}
+  );
 
-  const toastRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const exportRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => { document.documentElement.setAttribute("data-theme", theme); }, [theme]);
-
-  useEffect(() => {
-    invoke<AuthState>("get_auth_state")
-      .then(a => { setAuthState(a); setCheckingAuth(false); })
-      .catch(() => { setAuthState({ valid:false, allowed_meters:[] }); setCheckingAuth(false); });
-  }, []);
-
-  const showToast = useCallback((message:string, type: ToastState["type"]) => {
-    if (toastRef.current) clearTimeout(toastRef.current);
-    setToast({ message, type, visible:true });
-    toastRef.current = setTimeout(() => setToast(t => ({...t, visible:false})), 4000);
-  },[]);
-
-  useEffect(() => {
-    if (!authState?.valid) return;
-    invoke<PollState>("get_status").then(setPollState).catch(console.error);
-    if (authState.allowed_meters.length > 0) {
-      invoke<MeterProfile[]>("get_meter_profiles", { allowedMeters: authState.allowed_meters })
-        .then(setProfiles).catch(console.error);
-    }
-  },[authState?.valid]);
-
-  useEffect(() => {
-    if (!authState?.valid) return;
-    const subs: Promise<UnlistenFn>[] =[];
-    subs.push(listen<MeterReading>("meter-data", e => {
-      const r = e.payload;
-      setLatestReading(r);
-      const time = new Date(r.timestamp_ms).toLocaleTimeString("en-GB", { hour12:false });
-      setHistory(prev => {
-        const next = [...prev, { time, ...r.data }];
-        return next.length > MAX_HISTORY ? next.slice(-MAX_HISTORY) : next;
-      });
-    }));
-    subs.push(listen<StatusEvent>("status-changed", e => setPollState(e.payload.state)));
-    subs.push(listen<FaultEvent>("meter-fault", e => showToast(`⚠ FAULT: ${e.payload.reason}`, "warn")));
-    return () => { subs.forEach(p => p.then(fn => fn())); };
-  }, [authState?.valid, showToast]);
-
-  const handleSaveConfig = useCallback(async (model: string, slaveId: number, regs: RegisterEntry[]) => {
-    try {
-      const profile = await invoke<MeterProfile>("apply_device_config", {
-        meterModel: model, slaveId, selectedRegisters: regs,
-      });
-      setActiveDevice({ profile, slaveId, selectedRegisters: regs });
-      setShowModal(false);
-      showToast(`${profile.display_name} · ${regs.length} registers configured`, "success");
-    } catch(err) {
-      showToast(`Config failed: ${err}`, "error");
-    }
-  }, [showToast]);
-
-  const handleTogglePoll = useCallback(async () => {
-    if (!activeDevice) { showToast("Configure a device first.", "warn"); return; }
-    try {
-      const s = await invoke<PollState>("toggle_polling", { comPort: comPort.trim() });
-      setPollState(s);
-      showToast(s === "running" ? `Polling started on ${comPort}` : "Polling stopped", s === "running" ? "success" : "warn");
-    } catch(err) { showToast(`Error: ${err}`, "error"); }
-  }, [comPort, activeDevice, showToast]);
-
-  const handleClear = useCallback(async () => {
-    try {
-      const n = await invoke<number>("clear_history");
-      setHistory([]); setLatestReading(null);
-      showToast(`Cleared ${n.toLocaleString()} records`, "warn");
-    } catch(err) { showToast(`Clear failed: ${err}`, "error"); }
-  }, [showToast]);
-
-  const handleExport = useCallback(async () => {
-    try {
-      setExportStatus("saving");
-      const fp = await save({ title:"Export TechniDAQ Data",
-        defaultPath:`technidaq_${new Date().toISOString().slice(0,10)}.xlsx`,
-        filters:[{ name:"Excel Workbook", extensions:["xlsx"] }] });
-      if (!fp) { setExportStatus("idle"); return; }
-      const n = await invoke<number>("export_to_excel", { path: fp });
-      setExportStatus("success");
-      showToast(`Exported ${n.toLocaleString()} records`, "success");
-      if (exportRef.current) clearTimeout(exportRef.current);
-      exportRef.current = setTimeout(() => setExportStatus("idle"), 2500);
-    } catch(err) {
-      setExportStatus("error");
-      showToast(`Export failed: ${err}`, "error");
-      if (exportRef.current) clearTimeout(exportRef.current);
-      exportRef.current = setTimeout(() => setExportStatus("idle"), 3000);
-    }
-  }, [showToast]);
-
-  const chartKeys = useMemo((): string[] => {
-    if (!latestReading) return[];
-    const keys = Object.keys(latestReading.data);
-    const voltKey  = keys.find(k => k.toLowerCase().includes("voltage") && k.toLowerCase().includes("avg"))
-      ?? keys.find(k => k.toLowerCase().includes("voltage"));
-    const powerKey = keys.find(k => k.toLowerCase().includes("active power total"))
-      ?? keys.find(k => k.toLowerCase().includes("active power"))
-      ?? keys.find(k => k.toLowerCase().includes("power"));
-    return [voltKey, powerKey].filter(Boolean) as string[];
-  },[latestReading]);
+  const toastRef  = useRef<ReturnType<typeof setTimeout>|null>(null);
+  const exportRef = useRef<ReturnType<typeof setTimeout>|null>(null);
 
   const isDark = theme === "dark";
 
-  if (checkingAuth)      return <AuthLoadingScreen />;
-  if (!authState?.valid) return <LicenseGateway onActivated={setAuthState} />;
+  useEffect(()=>{ document.documentElement.setAttribute("data-theme",theme); },[theme]);
+  useEffect(()=>{
+    document.body.style.background = CLR.bgPage(isDark);
+  },[isDark]);
+
+  const showToast = useCallback((message:string, type:ToastState["type"])=>{
+    if(toastRef.current)clearTimeout(toastRef.current);
+    setToast({message,type,visible:true});
+    toastRef.current=setTimeout(()=>setToast(t=>({...t,visible:false})),4000);
+  },[]);
+
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  useEffect(()=>{
+    invoke<AuthState>("get_auth_state")
+      .then(a=>{setAuthState(a);setCheckingAuth(false);})
+      .catch(()=>{setAuthState({valid:false,allowed_meters:[]});setCheckingAuth(false);});
+  },[]);
+
+  useEffect(()=>{
+    if(!authState?.valid)return;
+    invoke<PollState>("get_status").then(setPollState).catch(console.error);
+    if(authState.allowed_meters.length>0){
+      invoke<MeterProfile[]>("get_meter_profiles",{allowedMeters:authState.allowed_meters})
+        .then(setProfiles)
+        .catch(e=>showToast(`Failed to load profiles: ${e}`,"error"));
+    }
+  },[authState?.valid]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Events ────────────────────────────────────────────────────────────────
+  useEffect(()=>{
+    if(!authState?.valid)return;
+    const subs:Promise<UnlistenFn>[]=[];
+
+    subs.push(listen<MeterReading>("meter-data",e=>{
+      const r=e.payload;
+      setLastPollMs(r.timestamp_ms);
+      setLatestByDevice(prev=>({...prev,[r.device_name]:r}));
+      const time=new Date(r.timestamp_ms).toLocaleTimeString("en-GB",{hour12:false});
+      setHistoryByDevice(prev=>{
+        const old=prev[r.device_name]??[];
+        const next=[...old];
+        if(next.length>0&&next[next.length-1].time===time)
+          next[next.length-1]={...next[next.length-1],...r.data};
+        else next.push({time,...r.data});
+        return {...prev,[r.device_name]:next.length>MAX_HISTORY?next.slice(-MAX_HISTORY):next};
+      });
+    }));
+    subs.push(listen<StatusEvent>("status-changed",e=>setPollState(e.payload.state)));
+    subs.push(listen<FaultEvent>("meter-fault",e=>
+      showToast(`⚠ ${e.payload.device_name}: ${e.payload.reason}`,"warn")));
+
+    return ()=>{subs.forEach(p=>p.then(fn=>fn()));};
+  },[authState?.valid,showToast]);
+
+  // ── Save bus config ───────────────────────────────────────────────────────
+  const handleSaveBusConfig = useCallback(async (devices:DeviceConfig[])=>{
+    try {
+      const confirmed = await invoke<DeviceConfig[]>("apply_bus_config",{devices});
+      setConfiguredDevices(confirmed);
+      // Auto-select first tab
+      if(confirmed.length>0)setActiveTab(confirmed[0].device_name);
+      setShowModal(false);
+      setLatestByDevice({});
+      setHistoryByDevice({});
+      const totalRegs=confirmed.reduce((s,d)=>s+d.selected_registers.length,0);
+      showToast(`${confirmed.length} device${confirmed.length>1?"s":""} configured · ${totalRegs} registers`,"success");
+    } catch(e){showToast(`Config error: ${e}`,"error");}
+  },[showToast]);
+
+  // ── Poll toggle ───────────────────────────────────────────────────────────
+  const handleTogglePoll = useCallback(async ()=>{
+    if(configuredDevices.length===0){showToast("Configure bus devices first.","warn");return;}
+    try {
+      const s=await invoke<PollState>("toggle_polling",{comPort:comPort.trim()});
+      setPollState(s);
+      showToast(s==="running"
+        ?`Polling ${configuredDevices.length} device(s) on ${comPort}`
+        :"Polling stopped",
+        s==="running"?"success":"warn");
+    } catch(e){showToast(`Error: ${e}`,"error");}
+  },[comPort,configuredDevices,showToast]);
+
+  // ── Clear ─────────────────────────────────────────────────────────────────
+  const handleClear = useCallback(async ()=>{
+    try {
+      const n=await invoke<number>("clear_history");
+      setLatestByDevice({});setHistoryByDevice({});
+      showToast(`Cleared ${n.toLocaleString()} records`,"warn");
+    } catch(e){showToast(`Clear failed: ${e}`,"error");}
+  },[showToast]);
+
+  // ── Export ────────────────────────────────────────────────────────────────
+  const handleExport = useCallback(async (target:string|null)=>{
+    const rangeLabel = timeRange === null       ? "all"
+                     : timeRange <= 300         ? "live"
+                     : timeRange <= 3600        ? "1h"
+                     : timeRange <= 86400       ? "24h"
+                     :                           "7d";
+    const dateSuffix = new Date().toISOString().slice(0,10);
+    const defaultName = target
+      ? `${target.replace(/\s+/g,"_")}_${rangeLabel}_${dateSuffix}.xlsx`
+      : `technidaq_all_${rangeLabel}_${dateSuffix}.xlsx`;
+    try {
+      setExportStatus("saving");
+      const fp = await save({
+        title: target ? `Export — ${target}` : "Export All Meters",
+        defaultPath: defaultName,
+        filters:[{name:"Excel Workbook",extensions:["xlsx"]}],
+      });
+      if(!fp){setExportStatus("idle");return;}
+      const n = await invoke<number>("export_to_excel",{
+        path:              fp,
+        targetDevice:      target ?? null,
+        timeRangeSeconds:  timeRange ?? null,
+        username:          authState?.username  ?? "",
+        projectName:       authState?.project_name ?? "",
+      });
+      setExportStatus("success");
+      showToast(`Exported ${n.toLocaleString()} records${target?` — ${target}`:""}`, "success");
+      if(exportRef.current)clearTimeout(exportRef.current);
+      exportRef.current=setTimeout(()=>setExportStatus("idle"),2500);
+    } catch(e){
+      setExportStatus("error");
+      showToast(`Export failed: ${e}`,"error");
+      if(exportRef.current)clearTimeout(exportRef.current);
+      exportRef.current=setTimeout(()=>setExportStatus("idle"),3000);
+    }
+  },[timeRange, authState, showToast]);
+
+  // ── Logout ────────────────────────────────────────────────────────────────
+  const handleLogout = useCallback(async ()=>{
+    setLogoutBusy(true);
+    try {
+      await invoke("logout_user");
+      // Reset all runtime state — history intentionally preserved in DB
+      setAuthState({valid:false, allowed_meters:[]});
+      setConfiguredDevices([]);
+      setProfiles([]);
+      setLatestByDevice({});
+      setHistoryByDevice({});
+      setActiveTab("");
+      setPollState("stopped");
+      setShowLogout(false);
+    } catch(e){
+      showToast(`Logout failed: ${e}`,"error");
+    } finally {
+      setLogoutBusy(false);
+    }
+  },[showToast]);
+
+  // ── Simulation flag ───────────────────────────────────────────────────────
+  const isSimulation = authState?.allowed_meters.includes("Simulation") ?? false;
+
+  // ── Active tab device ─────────────────────────────────────────────────────
+  const activeDevice = configuredDevices.find(d=>d.device_name===activeTab);
+  const activeTabIdx = configuredDevices.findIndex(d=>d.device_name===activeTab);
+  const tabAccent    = TAB_ACCENTS[activeTabIdx >= 0 ? activeTabIdx % TAB_ACCENTS.length : 0];
+
+  const activeLatest  = activeTab ? (latestByDevice[activeTab]?.data??{}) : {};
+  const activeHistory = activeTab ? (historyByDevice[activeTab]??[])        : [];
+
+  // Chart keys: pick 1 voltage + 1 power from active tab's registers
+  const chartKeys = useMemo(()=>{
+    if(!activeDevice)return [];
+    const names = activeDevice.selected_registers.map(r=>r.name);
+    const vk = names.find(n=>n.toLowerCase().includes("voltage l-l avg"))
+            ?? names.find(n=>n.toLowerCase().includes("voltage l-n"))
+            ?? names.find(n=>n.toLowerCase().includes("voltage"));
+    const pk = names.find(n=>n.toLowerCase().includes("active power total"))
+            ?? names.find(n=>n.toLowerCase().includes("active power"));
+    return ([vk,pk].filter(Boolean) as string[]).slice(0,2);
+  },[activeDevice]);
+
+  // ── Guards ────────────────────────────────────────────────────────────────
+  if (checkingAuth)      return <AuthLoadingScreen/>;
+  if (!authState?.valid) return <LicenseGateway onActivated={setAuthState}/>;
 
   return (
-    <div className="app-root">
-      <div className="ambient-glow glow-tl" />
-      <div className="ambient-glow glow-br" />
-      <Toast {...toast} />
+    <div className="tdaq-page" style={{
+      display:"flex", flexDirection:"column", height:"100vh", overflow:"hidden",
+    }}>
+      <Toast {...toast}/>
 
       {showModal && profiles.length > 0 && (
         <DeviceSetupModal
           profiles={profiles}
-          initialModel={activeDevice?.profile.model ?? profiles[0]?.model ?? ""}
-          initialSlaveId={activeDevice?.slaveId ?? 1}
-          initialSelected={activeDevice?.selectedRegisters ?? (profiles[0]?.registers ??[])}
-          onSave={handleSaveConfig}
-          onClose={() => setShowModal(false)}
+          initialDevices={configuredDevices}
+          onSave={handleSaveBusConfig}
+          onClose={()=>setShowModal(false)}
           theme={theme}
         />
       )}
 
-      <Header
-        pollState={pollState} latestReading={latestReading} theme={theme}
-        onThemeToggle={() => setTheme(t => t === "dark" ? "light" : "dark")}
+      {showLogout && (
+        <LogoutModal
+          username={authState?.username??""}
+          projectName={authState?.project_name??""}
+          onConfirm={handleLogout}
+          onClose={()=>setShowLogout(false)}
+          theme={theme}
+          busy={logoutBusy}
+        />
+      )}
+
+      <AppHeader
+        pollState={pollState} lastPollMs={lastPollMs} theme={theme}
+        onThemeToggle={()=>setTheme(t=>t==="dark"?"light":"dark")}
         onTogglePoll={handleTogglePoll} onClear={handleClear}
         onExport={handleExport} exportStatus={exportStatus}
         comPort={comPort} onComPortChange={setComPort}
-        username={authState?.username ?? ""}
-        projectName={authState?.project_name ?? ""}
-        activeDevice={activeDevice}
-        onOpenModal={() => setShowModal(true)}
+        username={authState?.username??""}
+        projectName={authState?.project_name??""}
+        onLogout={()=>setShowLogout(true)}
+        configuredDevices={configuredDevices}
+        activeDeviceName={activeDevice?.device_name}
+        isSimulation={isSimulation}
       />
 
-      <main className="app-main">
-        <div className="section-label-row">
-          <span className="section-label">
-            {latestReading
-              ? `Live Readings — ${latestReading.device_id}`
-              : "Real-Time Measurements"}
-          </span>
-          <div className="section-divider" />
-          <span className="section-meta">Δt = 1.000 s</span>
-        </div>
+      <BusBar
+        configuredDevices={configuredDevices}
+        pollState={pollState}
+        onOpenModal={()=>setShowModal(true)}
+        isDark={isDark}
+      />
 
-        {latestReading && Object.keys(latestReading.data).length > 0 ? (
+      <DeviceTabBar
+        devices={configuredDevices}
+        activeTab={activeTab}
+        onSelect={setActiveTab}
+        pollState={pollState}
+        isDark={isDark}
+      />
+
+      {/* ── Main scrollable content ─────────────────────────────────────── */}
+      <main style={{
+        flex:"1 1 0", overflowY:"auto", padding:"20px",
+        display:"flex", flexDirection:"column", gap:"16px",
+      }}>
+
+        {configuredDevices.length === 0 ? (
+          /* ── No devices empty state ──────────────────────────────────── */
           <div style={{
-            display:"grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))",
-            gap:"12px", marginBottom:"16px",
-          }}>
-            {Object.entries(latestReading.data).map(([name, value], idx) => (
-              <DynamicCard key={name} name={name} value={value} idx={idx} isDark={isDark} />
-            ))}
-          </div>
-        ) : (
-          <div style={{
-            height:"120px", display:"flex", alignItems:"center", justifyContent:"center",
-            background: isDark ? "rgba(255,255,255,0.02)" : "rgba(22,53,212,0.02)",
-            border: `1px solid ${isDark ? "rgba(255,255,255,0.05)" : "rgba(22,53,212,0.08)"}`,
-            borderRadius:"10px", marginBottom:"16px",
+            flex:1, display:"flex", alignItems:"center", justifyContent:"center",
           }}>
             <div style={{ textAlign:"center" }}>
-              <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.65rem",
-                letterSpacing:"0.2em", color: isDark ? "#2a3550" : "#94a3b8", textTransform:"uppercase" }}>
-                {!activeDevice ? "No device configured" : pollState === "stopped" ? "Polling stopped" : "Awaiting data…"}
+              <div style={{ width:56,height:56,background:CLR.blue+"18",
+                border:`1px solid ${CLR.blue}30`,borderRadius:"14px",
+                display:"flex",alignItems:"center",justifyContent:"center",
+                margin:"0 auto 16px" }}>
+                <svg viewBox="0 0 24 24" width="24" height="24" fill="none"
+                  stroke={CLR.blue} strokeWidth={1.5}>
+                  <circle cx="12" cy="12" r="3"/>
+                  <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                </svg>
               </div>
-              {!activeDevice && (
-                <button onClick={() => setShowModal(true)} style={{
-                  marginTop:"10px", padding:"6px 14px",
-                  background:"rgba(34,68,240,0.12)", border:"1px solid rgba(34,68,240,0.35)",
-                  borderRadius:"6px", color:"#6b8fff", cursor:"pointer",
-                  fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:"0.7rem", letterSpacing:"0.1em",
-                }}>Configure Device →</button>
-              )}
+              <div style={{ fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:"1.1rem",
+                color:CLR.text1(isDark),letterSpacing:"0.04em",marginBottom:"6px" }}>
+                No Bus Configured
+              </div>
+              <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.62rem",
+                color:CLR.text3(isDark),letterSpacing:"0.1em",marginBottom:"20px" }}>
+                Add your RS485 devices to begin monitoring
+              </div>
+              <button onClick={()=>setShowModal(true)} style={{
+                padding:"10px 24px",background:CLR.blue,border:`1px solid ${CLR.blue}`,
+                borderRadius:"7px",color:"#fff",cursor:"pointer",
+                fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+                fontSize:"0.82rem",letterSpacing:"0.1em",
+                boxShadow:`0 4px 14px ${CLR.blue}44`,
+              }}>Configure Bus →</button>
             </div>
+          </div>
+
+        ) : activeDevice ? (
+          <>
+            {/* ── Section header ──────────────────────────────────────── */}
+            <div style={{ display:"flex",alignItems:"center",gap:"10px" }}>
+              <div style={{ width:"3px",height:"18px",borderRadius:"2px",background:tabAccent }}/>
+              <span style={{ fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+                fontSize:"0.82rem",letterSpacing:"0.14em",textTransform:"uppercase",
+                color:CLR.text1(isDark) }}>
+                {activeDevice.device_name}
+              </span>
+              <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.58rem",
+                color:CLR.text3(isDark),letterSpacing:"0.06em" }}>
+                {activeDevice.meter_model.replace(/_/g," ")} · Slave {activeDevice.slave_id}
+                · {activeDevice.poll_rate_ms/1000}s · {activeDevice.selected_registers.length} registers
+              </span>
+              <div style={{ flex:1,height:"1px",background:CLR.border(isDark) }}/>
+            </div>
+
+            {/* ── Metric cards: auto-fill, stretch to full width ───────── */}
+            <div style={{
+              display:"grid",
+              gridTemplateColumns:"repeat(auto-fill, minmax(160px, 1fr))",
+              gap:"10px",
+            }}>
+              {activeDevice.selected_registers.map((reg,i)=>(
+                <MetricCard
+                  key={reg.name} name={reg.name}
+                  value={activeLatest[reg.name]}
+                  idx={i} isDark={isDark}
+                />
+              ))}
+            </div>
+
+            {/* ── Timeframe selector ───────────────────────────────────── */}
+            {(()=>{
+              const ranges:[string, number|null][] = [
+                ["Live",    300],
+                ["1 Hour",  3600],
+                ["24 Hours",86400],
+                ["7 Days",  604800],
+                ["All",     null],
+              ];
+              const rangeLabel = ranges.find(([,v])=>v===timeRange)?.[0] ?? "All";
+              return (
+                <div style={{
+                  display:"flex", alignItems:"center", gap:"6px",
+                  ...glass(isDark), padding:"6px 10px", flexShrink:0,
+                }}>
+                  <span style={{
+                    fontFamily:"'Share Tech Mono',monospace", fontSize:"0.5rem",
+                    letterSpacing:"0.2em", textTransform:"uppercase",
+                    color:CLR.text3(isDark), marginRight:"4px", whiteSpace:"nowrap",
+                  }}>Export Range</span>
+                  {ranges.map(([label, val])=>{
+                    const active = val === timeRange;
+                    return (
+                      <button key={label} onClick={()=>setTimeRange(val)} style={{
+                        padding:"3px 12px", height:"26px",
+                        borderRadius:"5px",
+                        background: active ? tabAccent+"22" : "transparent",
+                        border:`1px solid ${active ? tabAccent+"66" : CLR.border(isDark)}`,
+                        color: active ? tabAccent : CLR.text2(isDark),
+                        fontFamily:"'Rajdhani',sans-serif",
+                        fontWeight: active ? 700 : 500,
+                        fontSize:"0.72rem", letterSpacing:"0.06em",
+                        cursor:"pointer", whiteSpace:"nowrap",
+                        transition:"all 0.12s ease",
+                      }}>{label}</button>
+                    );
+                  })}
+                  <div style={{ flex:1 }}/>
+                  <span style={{
+                    fontFamily:"'Share Tech Mono',monospace", fontSize:"0.54rem",
+                    letterSpacing:"0.1em", color:CLR.text3(isDark),
+                  }}>
+                    Export will use: <span style={{ color:tabAccent }}>{rangeLabel}</span>
+                  </span>
+                </div>
+              );
+            })()}
+
+            {/* ── Waveform chart ────────────────────────────────────────── */}
+            <WaveformChart
+              history={activeHistory}
+              chartKeys={chartKeys}
+              pollState={pollState}
+              tabAccent={tabAccent}
+              isDark={isDark}
+            />
+          </>
+
+        ) : (
+          /* ── Tab selected but activeDevice not found (shouldn't happen) */
+          <div style={{ textAlign:"center",padding:"40px",
+            fontFamily:"'Share Tech Mono',monospace",fontSize:"0.64rem",
+            color:CLR.text3(isDark),letterSpacing:"0.14em" }}>
+            Select a device tab above
           </div>
         )}
 
-        <ChartSection history={history} chartKeys={chartKeys} theme={theme} pollState={pollState} />
-
-        <div className="status-bar">
+        {/* ── Status bar ─────────────────────────────────────────────────── */}
+        <div style={{
+          display:"flex",alignItems:"center",gap:"0",
+          ...glass(isDark),
+          overflow:"hidden",
+          flexShrink:0,
+        }}>
           {[
-            { label:"Device",   value: activeDevice ? `${activeDevice.profile.model.replace(/_/g," ")} #${String(activeDevice.slaveId).padStart(2,"0")}` : "—" },
-            { label:"COM Port", value: comPort || "—" },
-            { label:"Baud",     value: activeDevice ? activeDevice.profile.baud_rate.toLocaleString() : "—" },
-            { label:"Engine",   value: pollState.toUpperCase(), cls: `engine-chip-${pollState}` },
-          ].map(({ label, value, cls }) => (
-            <div key={label} className={`status-chip ${cls ?? ""}`}>
-              <span className="chip-label">{label}</span>
-              <span className="chip-value">{value}</span>
+            {label:"Device",  value:activeDevice?.device_name??"—"},
+            {label:"COM Port",value:isSimulation?"SIM":comPort,
+              color:isSimulation?CLR.amber:undefined},
+            {label:"Baud",    value:isSimulation?"—":activeDevice
+              ? (profiles.find(p=>p.model===activeDevice.meter_model)?.baud_rate.toLocaleString()??"—")
+              : "—"},
+            {label:"Engine",  value:isSimulation&&pollState==="running"?"SIMULATION":pollState.toUpperCase(),
+              color:isSimulation&&pollState==="running"?CLR.amber:pollState==="running"?CLR.green:pollState==="fault"?CLR.red:CLR.text3(isDark)},
+          ].map(({label,value,color},i,arr)=>(
+            <div key={label} style={{
+              flex:1,padding:"8px 14px",
+              borderRight:i<arr.length-1?`1px solid ${CLR.border(isDark)}`:"none",
+            }}>
+              <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",
+                letterSpacing:"0.2em",textTransform:"uppercase",color:CLR.text3(isDark),
+                marginBottom:"3px" }}>{label}</div>
+              <div style={{ fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+                fontSize:"0.85rem",letterSpacing:"0.05em",
+                color:color??CLR.text1(isDark) }}>{value}</div>
             </div>
           ))}
         </div>
 
-        <div className="sim-notice">
-          <div className="sim-line" />
-          <span className="sim-text">
-            {activeDevice
-              ? `RS485 MODBUS RTU · ${activeDevice.profile.display_name} · SLAVE ${activeDevice.slaveId} · FC03 HOLDING REGISTERS · ${activeDevice.profile.endianness} · ${activeDevice.selectedRegisters.length} REGISTERS`
-              : "RS485 MODBUS RTU · TechniDAQ Universal SCADA · Configure a device to begin"}
-          </span>
-          <div className="sim-line" />
-        </div>
       </main>
     </div>
   );
