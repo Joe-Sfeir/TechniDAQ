@@ -1,8 +1,8 @@
 // src/App.tsx  — TechniDAQ Phase 5 (High-Contrast Tabbed SCADA Dashboard)
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
+import logoUrl from "./assets/logo.png";
+import { invokeApi, listenApi, isTauri, type UnlistenFn } from "./api";
+// @tauri-apps/plugin-dialog is loaded dynamically so it never executes in a browser.
 import {
   ResponsiveContainer, LineChart, Line,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend,
@@ -14,6 +14,7 @@ import "./App.css";
 interface RegisterEntry {
   name: string; address: number; length: number;
   data_type: string; multiplier: number;
+  min_alarm?: number; max_alarm?: number;
 }
 interface MeterProfile {
   model: string; display_name: string; endianness: string;
@@ -22,6 +23,12 @@ interface MeterProfile {
 interface DeviceConfig {
   device_name: string; meter_model: string; slave_id: number;
   poll_rate_ms: number; selected_registers: RegisterEntry[];
+  alarm_trigger_cycles: number;
+  protocol:   "rtu" | "tcp";
+  com_port:   string;
+  baud_rate:  number;
+  ip_address: string;
+  tcp_port:   number;
 }
 interface MeterReading {
   device_name: string; device_id: string;
@@ -33,6 +40,7 @@ interface AuthState {
   valid: boolean; username?: string; project_name?: string;
   expiry_date?: number; allowed_meters: string[];
 }
+interface DiagEvent { direction: string; hex: string; device_name: string; timestamp_ms: number; }
 
 type PollState    = "running" | "stopped" | "fault";
 type Theme        = "dark"   | "light";
@@ -46,7 +54,8 @@ const COM_PORTS   = ["COM1","COM2","COM3","COM4","COM5","COM6","COM7",
 const DATA_TYPES  = ["Float32","UInt16","UInt32","INT16","INT32"];
 
 const DEFAULT_DEVICE = (): DeviceConfig => ({
-  device_name:"", meter_model:"", slave_id:1, poll_rate_ms:1000, selected_registers:[],
+  device_name:"", meter_model:"", slave_id:1, poll_rate_ms:1000, selected_registers:[], alarm_trigger_cycles:5,
+  protocol:"rtu", com_port:"COM3", baud_rate:9600, ip_address:"", tcp_port:502,
 });
 
 // ─── Design tokens ────────────────────────────────────────────────────────────
@@ -100,6 +109,11 @@ const DOT_GRID_CSS = `
   [data-theme="light"] { --pg: #f1f5f9; --dot: rgba(15,23,42,0.07); }
   @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.35} }
   @keyframes spin { to{transform:rotate(360deg)} }
+  @keyframes alarm-red   { 0%,100%{box-shadow:0 0 0 1.5px #ef4444,0 0 0 3px #ef444422} 50%{box-shadow:0 0 0 2px #ef4444,0 0 16px 4px #ef444444} }
+  @keyframes alarm-amber { 0%,100%{box-shadow:0 0 0 1.5px #f59e0b,0 0 0 3px #f59e0b22} 50%{box-shadow:0 0 0 2px #f59e0b,0 0 16px 4px #f59e0b44} }
+  [data-theme="dark"] select { background:#1c2128 !important; color:#f1f5f9 !important; }
+  [data-theme="dark"] select option { background:#1c2128; color:#f1f5f9; }
+  [data-theme="light"] select { background:#ffffff; color:#0f172a; }
 `;
 
 const TAB_ACCENTS  = [CLR.blue,CLR.green,CLR.amber,CLR.purple,CLR.red,CLR.teal,CLR.orange,CLR.indigo];
@@ -130,8 +144,9 @@ function regPalette(name:string, idx:number) {
 
 // ─── MetricCard ───────────────────────────────────────────────────────────────
 
-function MetricCard({ name, value, idx, isDark }:{
+function MetricCard({ name, value, idx, isDark, sparkData, minAlarm, maxAlarm }:{
   name:string; value:number|undefined; idx:number; isDark:boolean;
+  sparkData?: number[]; minAlarm?: number; maxAlarm?: number;
 }) {
   const p      = regPalette(name, idx);
   const hasVal = value !== undefined && !isNaN(value);
@@ -141,6 +156,10 @@ function MetricCard({ name, value, idx, isDark }:{
        : abs>=1   ? value!.toFixed(2) : value!.toFixed(4))
     : "——";
 
+  const isOverMax  = maxAlarm !== undefined && hasVal && value! > maxAlarm;
+  const isUnderMin = minAlarm !== undefined && hasVal && value! < minAlarm;
+  const alarmColor = isOverMax ? CLR.red : isUnderMin ? CLR.amber : undefined;
+
   return (
     <div style={{
       ...glass(isDark),
@@ -149,6 +168,8 @@ function MetricCard({ name, value, idx, isDark }:{
       minWidth:     0, overflow:"hidden",
       position:     "relative",
       transition:   "box-shadow 0.2s ease",
+      animation: alarmColor ? `${isOverMax ? "alarm-red" : "alarm-amber"} 1.2s ease-in-out infinite` : undefined,
+      border: alarmColor ? `1px solid ${alarmColor}` : undefined,
     }}>
       {/* Delicate top accent line */}
       <div style={{
@@ -186,6 +207,17 @@ function MetricCard({ name, value, idx, isDark }:{
           )}
         </div>
       </div>
+
+      {sparkData && sparkData.length > 1 && (
+        <div style={{ padding:"0 16px 10px", marginTop:"-4px" }}>
+          <ResponsiveContainer width="100%" height={36}>
+            <LineChart data={sparkData.map((v,i)=>({i,v}))} margin={{top:2,right:2,bottom:2,left:2}}>
+              <Line type="monotone" dataKey="v" stroke={alarmColor ?? p.border}
+                strokeWidth={1.5} dot={false} isAnimationActive={false}/>
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
 
       {/* Subtle glow blob in card corner */}
       <div style={{
@@ -282,6 +314,9 @@ function WaveformChart({ history, chartKeys, pollState, tabAccent, isDark }:{
   tabAccent:string; isDark:boolean;
 }) {
   const [viewMode, setViewMode] = useState<ViewMode>("chart");
+  const [visibleKeys, setVisibleKeys] = useState<Set<string>>(()=>new Set(chartKeys));
+  // Keep in sync when chartKeys changes
+  useEffect(()=>setVisibleKeys(new Set(chartKeys)), [chartKeys.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
   const stopped   = pollState === "stopped";
   const gridColor = isDark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.06)";
   const axisTick  = CLR.text3(isDark);
@@ -404,6 +439,46 @@ function WaveformChart({ history, chartKeys, pollState, tabAccent, isDark }:{
         </div>
       </div>
 
+      {/* Waveform line toggles */}
+      {viewMode === "chart" && chartKeys.length > 0 && (
+        <div style={{
+          display:"flex", alignItems:"center", gap:"6px", flexWrap:"wrap",
+          padding:"6px 16px", borderBottom:`1px solid ${CLR.border(isDark)}`,
+          flexShrink:0,
+        }}>
+          <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.5rem",
+            letterSpacing:"0.18em", textTransform:"uppercase", color:CLR.text3(isDark), marginRight:"2px" }}>
+            SHOW
+          </span>
+          {chartKeys.map((k,i)=>{
+            const on = visibleKeys.has(k);
+            const c  = LINE_COLORS[i % LINE_COLORS.length];
+            return (
+              <button key={k} onClick={()=>{
+                setVisibleKeys(prev=>{
+                  const s = new Set(prev);
+                  s.has(k) ? s.delete(k) : s.add(k);
+                  return s;
+                });
+              }} style={{
+                padding:"2px 10px", height:"22px", borderRadius:"20px",
+                background: on ? c+"22" : "transparent",
+                border: `1px solid ${on ? c+"88" : CLR.border(isDark)}`,
+                color: on ? c : CLR.text3(isDark),
+                fontFamily:"'Share Tech Mono',monospace", fontSize:"0.56rem",
+                letterSpacing:"0.06em", cursor:"pointer",
+                display:"flex", alignItems:"center", gap:"5px",
+                transition:"all 0.12s",
+              }}>
+                <div style={{ width:"8px", height:"8px", borderRadius:"50%",
+                  background: on ? c : CLR.borderDim(isDark), flexShrink:0 }}/>
+                {k}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {/* ── Chart view ─────────────────────────────────────────────────────── */}
       {viewMode === "chart" && (
         <div style={{ flex:"1 1 0", minHeight:"280px", padding:"8px 4px 8px 0", position:"relative" }}>
@@ -436,7 +511,7 @@ function WaveformChart({ history, chartKeys, pollState, tabAccent, isDark }:{
                   boxShadow:    "0 4px 16px rgba(0,0,0,0.3)",
                 }} cursor={{ stroke:CLR.borderDim(isDark), strokeWidth:1, strokeDasharray:"4 4" }}/>
                 <Legend wrapperStyle={{ display:"none" }}/>
-                {chartKeys.map((k,i)=>(
+                {chartKeys.filter(k=>visibleKeys.has(k)).map((k,i)=>(
                   <Line key={k} yAxisId={i===0?"l":"r"} type="monotone" dataKey={k}
                     stroke={LINE_COLORS[i%LINE_COLORS.length]} strokeWidth={2}
                     dot={false} activeDot={{ r:4, fill:LINE_COLORS[i%LINE_COLORS.length] }}
@@ -715,17 +790,16 @@ function ComPortSelector({ value, onChange, disabled, isDark }:{
 
 function AppHeader({
   pollState, lastPollMs, theme, onThemeToggle, onTogglePoll,
-  onClear, onExport, exportStatus, comPort, onComPortChange,
+  onClear, onExport, exportStatus,
   username, projectName, onLogout, configuredDevices, activeDeviceName,
-  isSimulation,
+  isSimulation, onOpenTerminal, hasDiagnostics,
 }:{
   pollState:PollState; lastPollMs:number; theme:Theme;
   onThemeToggle:()=>void; onTogglePoll:()=>void;
   onClear:()=>void; onExport:(t:string|null)=>void; exportStatus:ExportStatus;
-  comPort:string; onComPortChange:(v:string)=>void;
   username:string; projectName:string; onLogout:()=>void;
   configuredDevices:DeviceConfig[]; activeDeviceName:string|undefined;
-  isSimulation:boolean;
+  isSimulation:boolean; onOpenTerminal: ()=>void; hasDiagnostics: boolean;
 }) {
   const isDark    = theme === "dark";
   const isRunning = pollState === "running";
@@ -762,12 +836,7 @@ function AppHeader({
     }}>
       {/* Brand */}
       <div style={{ display:"flex",alignItems:"center",gap:"10px",flexShrink:0 }}>
-        <div style={{ width:"32px",height:"32px",background:CLR.blue,borderRadius:"7px",
-          display:"flex",alignItems:"center",justifyContent:"center" }}>
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="white">
-            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
-          </svg>
-        </div>
+        <img src={logoUrl} alt="Technicat Group" style={{ width:"36px",height:"36px",objectFit:"contain" }} />
         <div>
           <div style={{ fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:"1rem",
             letterSpacing:"0.06em",color:"#e6edf3",lineHeight:1 }}>TechniDAQ</div>
@@ -811,27 +880,25 @@ function AppHeader({
         </div>
 
         <div style={{ width:"1px",height:"28px",background:CLR.border(isDark) }}/>
-        {isSimulation
-          ? <div style={{
-              display:"flex", alignItems:"center", gap:"6px",
-              padding:"0 10px", height:"28px",
-              background:`${CLR.amber}15`,
-              border:`1px solid ${CLR.amber}44`,
-              borderRadius:"5px",
-            }}>
-              <span style={{ width:"6px",height:"6px",borderRadius:"50%",flexShrink:0,
-                background:CLR.amber,
-                boxShadow:`0 0 5px ${CLR.amber}`,
-                animation:"pulse-dot 2s ease-in-out infinite",
-              }}/>
-              <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.56rem",
-                letterSpacing:"0.14em",color:CLR.amber,textTransform:"uppercase" }}>
-                No Hardware
-              </span>
-            </div>
-          : <ComPortSelector value={comPort} onChange={onComPortChange}
-              disabled={isRunning||isFault} isDark={isDark}/>
-        }
+        {isSimulation && (
+          <div style={{
+            display:"flex", alignItems:"center", gap:"6px",
+            padding:"0 10px", height:"28px",
+            background:`${CLR.amber}15`,
+            border:`1px solid ${CLR.amber}44`,
+            borderRadius:"5px",
+          }}>
+            <span style={{ width:"6px",height:"6px",borderRadius:"50%",flexShrink:0,
+              background:CLR.amber,
+              boxShadow:`0 0 5px ${CLR.amber}`,
+              animation:"pulse-dot 2s ease-in-out infinite",
+            }}/>
+            <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.56rem",
+              letterSpacing:"0.14em",color:CLR.amber,textTransform:"uppercase" }}>
+              No Hardware
+            </span>
+          </div>
+        )}
         <div style={{ width:"1px",height:"28px",background:CLR.border(isDark) }}/>
 
         {/* Poll toggle */}
@@ -870,6 +937,26 @@ function AppHeader({
 
         <ExportDropdown activeDeviceName={activeDeviceName} exportStatus={exportStatus}
           onExport={onExport} isDark={isDark}/>
+
+        {hasDiagnostics && (
+          <>
+            <div style={{ width:"1px",height:"28px",background:CLR.border(isDark) }}/>
+            <button onClick={onOpenTerminal} style={{
+              display:"flex",alignItems:"center",gap:"6px",
+              padding:"0 12px",height:"34px",
+              background:isDark?"rgba(0,255,136,0.08)":"rgba(0,255,136,0.06)",
+              border:`1px solid rgba(0,255,136,0.3)`,borderRadius:"6px",
+              color:"#00ff88",cursor:"pointer",
+              fontFamily:"'Share Tech Mono',monospace",
+              fontSize:"0.65rem",letterSpacing:"0.1em",
+            }}>
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth={2}>
+                <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+              </svg>
+              TERMINAL
+            </button>
+          </>
+        )}
 
         <button onClick={onThemeToggle} style={{
           padding:"0 10px",height:"34px",
@@ -988,6 +1075,7 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove }:{
   const [customRegs,setCustomRegs]= useState<RegisterEntry[]>([]);
   const [draft,     setDraft]     = useState<CustomRegDraft>(EMPTY_DRAFT);
   const [draftErr,  setDraftErr]  = useState<string|null>(null);
+  const [alarms,    setAlarms]    = useState<Record<string, {min?:string, max?:string}>>({});
 
   const profile     = profiles.find(p=>p.model===device.meter_model);
   const profileRegs = profile?.registers??[];
@@ -1002,10 +1090,14 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove }:{
   const allOn    = allNames.length>0 && allNames.every(n=>checked.has(n));
 
   useEffect(()=>{
-    const regs = [...profileRegs,...customRegs].filter(r=>checked.has(r.name));
+    const regs = [...profileRegs,...customRegs].filter(r=>checked.has(r.name)).map(r=>({
+      ...r,
+      min_alarm: alarms[r.name]?.min !== undefined && alarms[r.name]!.min !== "" ? parseFloat(alarms[r.name]!.min!) : undefined,
+      max_alarm: alarms[r.name]?.max !== undefined && alarms[r.name]!.max !== "" ? parseFloat(alarms[r.name]!.max!) : undefined,
+    }));
     onUpdate({...device,selected_registers:regs});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[checked,customRegs]);
+  },[checked,customRegs,alarms]);
 
   const toggleReg = (name:string) =>
     setChecked(prev=>{const s=new Set(prev);s.has(name)?s.delete(name):s.add(name);return s;});
@@ -1014,7 +1106,8 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove }:{
     const np=profiles.find(p=>p.model===model);
     setChecked(new Set((np?.registers??[]).map(r=>r.name)));
     setCustomRegs([]);
-    onUpdate({...device,meter_model:model,selected_registers:np?.registers??[]});
+    onUpdate({...device,meter_model:model,selected_registers:np?.registers??[],
+      baud_rate:np?.baud_rate??device.baud_rate});
   };
 
   const addCustom = () => {
@@ -1089,7 +1182,7 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove }:{
 
       {expanded&&(
         <div style={{ padding:"14px" }}>
-          <div style={{ display:"grid",gridTemplateColumns:"2fr 2fr 1fr 1fr",
+          <div style={{ display:"grid",gridTemplateColumns:"2fr 2fr 1fr 1fr 1fr",
             gap:"10px",marginBottom:"14px" }}>
             <div>
               <label style={lS}>Device Name</label>
@@ -1120,6 +1213,53 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove }:{
                   if(s>=0.2)onUpdate({...device,poll_rate_ms:Math.round(s*1000)});
                 }}/>
             </div>
+            <div>
+              <label style={lS}>Alarm Cycles</label>
+              <input type="number" min={1} max={100} value={device.alarm_trigger_cycles}
+                title="Consecutive breaching polls before alarm email fires"
+                style={{...iS,textAlign:"center"}}
+                onChange={e=>{
+                  const v=parseInt(e.target.value,10);
+                  if(v>=1&&v<=100)onUpdate({...device,alarm_trigger_cycles:v});
+                }}/>
+            </div>
+          </div>
+
+          {/* ── Connection settings ─────────────────────────────────────── */}
+          <div style={{ display:"grid",gridTemplateColumns:"auto 1fr 1fr",gap:"10px",marginBottom:"14px",alignItems:"end" }}>
+            <div>
+              <label style={lS}>Protocol</label>
+              <select value={device.protocol} style={{...iS,cursor:"pointer",width:"auto",paddingRight:"24px"}}
+                onChange={e=>onUpdate({...device,protocol:e.target.value as "rtu"|"tcp"})}>
+                <option value="rtu">Modbus RTU</option>
+                <option value="tcp">Modbus TCP</option>
+              </select>
+            </div>
+            {device.protocol==="rtu" ? <>
+              <div>
+                <label style={lS}>COM Port</label>
+                <ComPortSelector value={device.com_port} onChange={v=>onUpdate({...device,com_port:v})} disabled={false} isDark={isDark}/>
+              </div>
+              <div>
+                <label style={lS}>Baud Rate</label>
+                <select value={device.baud_rate} style={{...iS,cursor:"pointer"}}
+                  onChange={e=>onUpdate({...device,baud_rate:parseInt(e.target.value,10)})}>
+                  {[1200,2400,4800,9600,19200,38400,57600,115200].map(b=><option key={b} value={b}>{b}</option>)}
+                </select>
+              </div>
+            </> : <>
+              <div>
+                <label style={lS}>IP Address</label>
+                <input type="text" value={device.ip_address} placeholder="192.168.1.50"
+                  style={iS} onChange={e=>onUpdate({...device,ip_address:e.target.value})}/>
+              </div>
+              <div>
+                <label style={lS}>TCP Port</label>
+                <input type="number" min={1} max={65535} value={device.tcp_port}
+                  style={{...iS,textAlign:"center"}}
+                  onChange={e=>{const v=parseInt(e.target.value,10);if(v>0&&v<=65535)onUpdate({...device,tcp_port:v});}}/>
+              </div>
+            </>}
           </div>
 
           {device.meter_model&&(
@@ -1203,6 +1343,24 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove }:{
                       color:CLR.text3(isDark),minWidth:"40px",textAlign:"right" }}>@{r.address}</span>
                     <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.52rem",
                       color:CLR.text3(isDark),minWidth:"52px",textAlign:"center" }}>{r.data_type}</span>
+                    {checked.has(r.name) && (
+                      <div onClick={e=>e.stopPropagation()} style={{ display:"flex", gap:"3px", alignItems:"center" }}>
+                        <input type="number" placeholder="Min" value={alarms[r.name]?.min??""}
+                          onChange={e=>setAlarms(a=>({...a,[r.name]:{...a[r.name],min:e.target.value}}))}
+                          style={{ width:"52px", height:"20px", fontSize:"0.56rem",
+                            background:isDark?"rgba(255,255,255,0.06)":"#f6f8fa",
+                            border:`1px solid ${CLR.border(isDark)}`, borderRadius:"3px",
+                            color:CLR.amber, textAlign:"center", outline:"none", padding:"0 4px",
+                            fontFamily:"'Share Tech Mono',monospace" }}/>
+                        <input type="number" placeholder="Max" value={alarms[r.name]?.max??""}
+                          onChange={e=>setAlarms(a=>({...a,[r.name]:{...a[r.name],max:e.target.value}}))}
+                          style={{ width:"52px", height:"20px", fontSize:"0.56rem",
+                            background:isDark?"rgba(255,255,255,0.06)":"#f6f8fa",
+                            border:`1px solid ${CLR.border(isDark)}`, borderRadius:"3px",
+                            color:CLR.red, textAlign:"center", outline:"none", padding:"0 4px",
+                            fontFamily:"'Share Tech Mono',monospace" }}/>
+                      </div>
+                    )}
                     {c&&(
                       <button onClick={e=>{e.stopPropagation();
                         setCustomRegs(p=>p.filter(x=>x.name!==r.name));
@@ -1295,6 +1453,16 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme }:{
       ? initialDevices
       : [{...DEFAULT_DEVICE(),meter_model:profiles[0]?.model??""}]
   );
+  const [notifEmail, setNotifEmail] = useState("");
+  const [emailSaved, setEmailSaved] = useState(false);
+  const [exportDir,  setExportDir]  = useState("");
+  const [dirSaved,   setDirSaved]   = useState(false);
+
+  useEffect(()=>{
+    invokeApi<string>("get_notification_email").then(setNotifEmail).catch(()=>{});
+    invokeApi<string>("get_export_path").then(setExportDir).catch(()=>{});
+  },[]);
+
   const updDevice = (i:number,d:DeviceConfig) => setDevices(p=>p.map((x,j)=>j===i?d:x));
   const remDevice = (i:number) => setDevices(p=>p.length>1?p.filter((_,j)=>j!==i):p);
   const addDevice = () => setDevices(p=>[...p,{...DEFAULT_DEVICE(),meter_model:profiles[0]?.model??""}]);
@@ -1314,6 +1482,12 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme }:{
 
   const totalRegs = devices.reduce((s,d)=>s+d.selected_registers.length,0);
   const border    = CLR.border(isDark);
+  const iS: React.CSSProperties = {
+    height:"32px", background:isDark?"rgba(255,255,255,0.04)":"#fff",
+    border:`1px solid ${border}`, borderRadius:"5px",
+    color:CLR.text1(isDark), fontFamily:"'Share Tech Mono',monospace",
+    fontSize:"0.7rem", letterSpacing:"0.04em", outline:"none", padding:"0 8px",
+  };
 
   return (
     <div style={{
@@ -1370,6 +1544,91 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme }:{
             </svg>
             Add Another Meter
           </button>
+
+          {/* Notifications */}
+          <div style={{ marginTop:"12px", ...glass(isDark), overflow:"hidden" }}>
+            <div style={{ padding:"8px 14px", borderBottom:`1px solid ${border}`,
+              background:isDark?"rgba(255,255,255,0.02)":"rgba(0,0,0,0.02)",
+              fontFamily:"'Share Tech Mono',monospace", fontSize:"0.5rem",
+              letterSpacing:"0.18em", textTransform:"uppercase", color:CLR.text3(isDark) }}>
+              Alarm Notifications (requires EmailAlerts license)
+            </div>
+            <div style={{ padding:"12px 14px", display:"flex", flexDirection:"column", gap:"10px" }}>
+              {/* Destination email */}
+              <div style={{ display:"flex", gap:"8px", alignItems:"center" }}>
+                <input type="email" value={notifEmail} placeholder="destination@email.com"
+                  onChange={e=>{setNotifEmail(e.target.value);setEmailSaved(false);}}
+                  style={{ ...iS, flex:1 }}/>
+                <button onClick={async ()=>{
+                  try {
+                    await invokeApi("save_notification_email", { email: notifEmail });
+                    setEmailSaved(true);
+                  } catch {}
+                }} style={{
+                  height:"32px", padding:"0 14px", borderRadius:"5px",
+                  background: emailSaved ? CLR.green+"20" : CLR.blue+"20",
+                  border:`1px solid ${emailSaved ? CLR.green+"50" : CLR.blue+"50"}`,
+                  color: emailSaved ? CLR.green : CLR.blue,
+                  cursor:"pointer", fontFamily:"'Rajdhani',sans-serif",
+                  fontWeight:700, fontSize:"0.72rem", whiteSpace:"nowrap",
+                }}>{emailSaved ? "Saved ✓" : "Save Email"}</button>
+              </div>
+            </div>
+          </div>
+
+          {/* Enterprise Data Directory */}
+          <div style={{ marginTop:"12px", ...glass(isDark), overflow:"hidden" }}>
+            <div style={{ padding:"8px 14px", borderBottom:`1px solid ${border}`,
+              background:isDark?"rgba(255,255,255,0.02)":"rgba(0,0,0,0.02)",
+              fontFamily:"'Share Tech Mono',monospace", fontSize:"0.5rem",
+              letterSpacing:"0.18em", textTransform:"uppercase", color:CLR.text3(isDark) }}>
+              Enterprise Data Directory (nightly exports + MID backups)
+            </div>
+            <div style={{ padding:"12px 14px", display:"flex", flexDirection:"column", gap:"8px" }}>
+              <div style={{ fontSize:"0.68rem", color:CLR.text2(isDark) }}>
+                Daily .xlsx files are written to <code style={{ fontFamily:"'Share Tech Mono',monospace" }}>[dir]/[device]/[YYYY]/[MM]/[YYYY-MM-DD].xlsx</code> at 23:58 local time.
+                Encrypted DB backups + SHA-256 hash go to <code style={{ fontFamily:"'Share Tech Mono',monospace" }}>[dir]/_backups/</code>.
+              </div>
+              <div style={{ display:"flex", gap:"8px", alignItems:"center" }}>
+                <div style={{ flex:1, ...iS, display:"flex", alignItems:"center",
+                  gap:"6px", cursor:"default", overflow:"hidden" }}>
+                  <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.65rem",
+                    color: exportDir ? CLR.text1(isDark) : CLR.text3(isDark),
+                    whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+                    {exportDir || "No directory selected"}
+                  </span>
+                </div>
+                <button onClick={async ()=>{
+                  if (!isTauri) return; // folder picker not available in browser
+                  const { open } = await import("@tauri-apps/plugin-dialog");
+                  const selected = await open({ directory:true, multiple:false });
+                  if (typeof selected === "string" && selected) {
+                    setExportDir(selected); setDirSaved(false);
+                  }
+                }} style={{
+                  height:"32px", padding:"0 14px", borderRadius:"5px",
+                  background:CLR.blue+"20", border:`1px solid ${CLR.blue+"50"}`,
+                  color:CLR.blue, cursor:"pointer", fontFamily:"'Rajdhani',sans-serif",
+                  fontWeight:700, fontSize:"0.72rem", whiteSpace:"nowrap",
+                }}>Browse</button>
+                <button onClick={async ()=>{
+                  if (!exportDir) return;
+                  try {
+                    await invokeApi("save_export_path", { path: exportDir });
+                    setDirSaved(true);
+                  } catch {}
+                }} disabled={!exportDir} style={{
+                  height:"32px", padding:"0 14px", borderRadius:"5px",
+                  background: dirSaved ? CLR.green+"20" : CLR.blue+"20",
+                  border:`1px solid ${dirSaved ? CLR.green+"50" : CLR.blue+"50"}`,
+                  color: dirSaved ? CLR.green : CLR.blue,
+                  cursor: exportDir ? "pointer" : "not-allowed",
+                  fontFamily:"'Rajdhani',sans-serif",
+                  fontWeight:700, fontSize:"0.72rem", whiteSpace:"nowrap",
+                }}>{dirSaved ? "Saved ✓" : "Save Dir"}</button>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",
@@ -1419,8 +1678,37 @@ function LicenseGateway({ onActivated }:{ onActivated:(auth:AuthState)=>void }) 
     if(!project.trim()) {setError("Project name is required.");return;}
     setBusy(true);
     try {
-      await invoke<string>("activate_license",{key:key.trim(),username:username.trim(),projectName:project.trim()});
-      const auth = await invoke<AuthState>("get_auth_state");
+      const payload = { key: key.trim(), username: username.trim(), projectName: project.trim() };
+      let activateMsg: string;
+      let auth: AuthState;
+
+      // __TAURI_INTERNALS__ is injected by Tauri v2 in the native webview.
+      // A plain browser never has it, so the dynamic import is never attempted there.
+      if ((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) {
+        const { invoke } = await import("@tauri-apps/api/core");
+        activateMsg = await invoke<string>("activate_license", payload);
+        auth        = await invoke<AuthState>("get_auth_state");
+      } else {
+        // Web / phone path: POST to the Axum REST API on the same host, port 3030.
+        const base = `http://${window.location.hostname}:3030/api`;
+        const activateRes = await fetch(`${base}/activate_license`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify(payload),
+        });
+        if (!activateRes.ok) throw new Error(await activateRes.text());
+        activateMsg = await activateRes.json() as string;
+
+        const authRes = await fetch(`${base}/get_auth_state`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    "{}",
+        });
+        if (!authRes.ok) throw new Error(await authRes.text());
+        auth = await authRes.json() as AuthState;
+      }
+
+      console.log("[license]", activateMsg);
       onActivated(auth);
     } catch(e) { setError(String(e)); }
     finally { setBusy(false); }
@@ -1454,13 +1742,8 @@ function LicenseGateway({ onActivated }:{ onActivated:(auth:AuthState)=>void }) 
           background:"linear-gradient(90deg,#1d6bff,#16a34a,#d97706)" }}/>
         <div style={{ padding:"32px" }}>
           <div style={{ textAlign:"center",marginBottom:"28px" }}>
-            <div style={{ width:44,height:44,margin:"0 auto 12px",
-              background:"#1d6bff",borderRadius:"10px",
-              display:"flex",alignItems:"center",justifyContent:"center" }}>
-              <svg viewBox="0 0 24 24" width="20" height="20" fill="white">
-                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
-              </svg>
-            </div>
+            <img src={logoUrl} alt="Technicat Group"
+              style={{ width:200,height:"auto",display:"block",margin:"0 auto 12px" }}/>
             <div style={{ fontFamily:"'Rajdhani',sans-serif",fontWeight:700,fontSize:"1.4rem",
               letterSpacing:"0.06em",color:"#e6edf3" }}>TechniDAQ</div>
             <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.52rem",
@@ -1655,6 +1938,74 @@ function AuthLoadingScreen() {
   );
 }
 
+// ─── DiagTerminal ─────────────────────────────────────────────────────────────
+
+interface DiagLine { direction: string; hex: string; device_name: string; ts: number; }
+
+function DiagTerminal({ lines, onClose, isDark: _isDark }:{
+  lines: DiagLine[]; onClose: ()=>void; isDark: boolean;
+}) {
+  const bottomRef = useRef<HTMLDivElement>(null);
+  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:"smooth"}); },[lines]);
+
+  return (
+    <div style={{
+      position:"fixed", bottom:0, left:0, right:0, height:"260px", zIndex:8000,
+      background:"#0d1117", borderTop:"2px solid #00ff8844",
+      display:"flex", flexDirection:"column",
+    }}>
+      {/* Header */}
+      <div style={{
+        display:"flex", alignItems:"center", justifyContent:"space-between",
+        padding:"6px 14px", borderBottom:"1px solid #00ff8822", flexShrink:0,
+        background:"#0d1117",
+      }}>
+        <div style={{ display:"flex", alignItems:"center", gap:"10px" }}>
+          <div style={{ width:"8px",height:"8px",borderRadius:"50%",
+            background:"#00ff88", boxShadow:"0 0 6px #00ff88",
+            animation:"pulse-dot 1.5s ease-in-out infinite" }}/>
+          <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.6rem",
+            letterSpacing:"0.2em",color:"#00ff88",textTransform:"uppercase" }}>
+            RAW MODBUS DIAGNOSTICS
+          </span>
+          <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.52rem",
+            color:"#3d4a5e",letterSpacing:"0.1em" }}>
+            {lines.length} frames
+          </span>
+        </div>
+        <button onClick={onClose} style={{
+          background:"none",border:"1px solid #00ff8833",borderRadius:"4px",
+          color:"#00ff8888",cursor:"pointer",
+          fontFamily:"'Share Tech Mono',monospace",fontSize:"0.56rem",
+          padding:"3px 10px",letterSpacing:"0.1em",
+        }}>CLOSE ✕</button>
+      </div>
+
+      {/* Log */}
+      <div style={{
+        flex:1, overflowY:"auto", padding:"8px 14px",
+        fontFamily:"'Share Tech Mono',monospace", fontSize:"0.62rem",
+      }}>
+        {lines.length === 0 ? (
+          <span style={{ color:"#3d4a5e",letterSpacing:"0.14em" }}>Waiting for frames…</span>
+        ) : lines.map((l,i)=>{
+          const c = l.direction==="TX" ? "#60a5fa" : l.direction==="RX" ? "#00ff88" : "#ef4444";
+          const ts = new Date(l.ts).toLocaleTimeString("en-GB",{hour12:false});
+          return (
+            <div key={i} style={{ lineHeight:"1.7", color:"#94a3b8" }}>
+              <span style={{ color:"#3d4a5e" }}>[{ts}] </span>
+              <span style={{ color:"#475569" }}>{l.device_name.slice(0,16).padEnd(16)} </span>
+              <span style={{ color:c, fontWeight:700 }}>{l.direction === "TX" ? "►" : "◄"} {l.direction} </span>
+              <span style={{ color:c+"cc" }}>{l.hex}</span>
+            </div>
+          );
+        })}
+        <div ref={bottomRef}/>
+      </div>
+    </div>
+  );
+}
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -1675,10 +2026,11 @@ export default function App() {
   const [pollState,         setPollState]          = useState<PollState>("stopped");
   const [theme,             setTheme]              = useState<Theme>("dark");
   const [exportStatus,      setExportStatus]       = useState<ExportStatus>("idle");
-  const [comPort,           setComPort]            = useState("COM3");
   const [toast,             setToast]              = useState<ToastState>(
     {message:"",type:"success",visible:false}
   );
+  const [showTerminal,      setShowTerminal]       = useState(false);
+  const [diagLines,         setDiagLines]          = useState<DiagLine[]>([]);
 
   const toastRef  = useRef<ReturnType<typeof setTimeout>|null>(null);
   const exportRef = useRef<ReturnType<typeof setTimeout>|null>(null);
@@ -1698,16 +2050,16 @@ export default function App() {
 
   // ── Auth ──────────────────────────────────────────────────────────────────
   useEffect(()=>{
-    invoke<AuthState>("get_auth_state")
+    invokeApi<AuthState>("get_auth_state")
       .then(a=>{setAuthState(a);setCheckingAuth(false);})
       .catch(()=>{setAuthState({valid:false,allowed_meters:[]});setCheckingAuth(false);});
   },[]);
 
   useEffect(()=>{
     if(!authState?.valid)return;
-    invoke<PollState>("get_status").then(setPollState).catch(console.error);
+    invokeApi<PollState>("get_status").then(setPollState).catch(console.error);
     if(authState.allowed_meters.length>0){
-      invoke<MeterProfile[]>("get_meter_profiles",{allowedMeters:authState.allowed_meters})
+      invokeApi<MeterProfile[]>("get_meter_profiles",{allowedMeters:authState.allowed_meters})
         .then(setProfiles)
         .catch(e=>showToast(`Failed to load profiles: ${e}`,"error"));
     }
@@ -1718,7 +2070,7 @@ export default function App() {
     if(!authState?.valid)return;
     const subs:Promise<UnlistenFn>[]=[];
 
-    subs.push(listen<MeterReading>("meter-data",e=>{
+    subs.push(listenApi<MeterReading>("meter-data",e=>{
       const r=e.payload;
       setLastPollMs(r.timestamp_ms);
       setLatestByDevice(prev=>({...prev,[r.device_name]:r}));
@@ -1732,9 +2084,17 @@ export default function App() {
         return {...prev,[r.device_name]:next.length>MAX_HISTORY?next.slice(-MAX_HISTORY):next};
       });
     }));
-    subs.push(listen<StatusEvent>("status-changed",e=>setPollState(e.payload.state)));
-    subs.push(listen<FaultEvent>("meter-fault",e=>
+    subs.push(listenApi<StatusEvent>("status-changed",e=>setPollState(e.payload.state)));
+    subs.push(listenApi<FaultEvent>("meter-fault",e=>
       showToast(`⚠ ${e.payload.device_name}: ${e.payload.reason}`,"warn")));
+    subs.push(listenApi<DiagEvent>("diag-frame", e=>{
+      const p = e.payload;
+      setDiagLines(prev=>{
+        const line: DiagLine = { direction:p.direction, hex:p.hex, device_name:p.device_name, ts:p.timestamp_ms };
+        const next = [...prev, line];
+        return next.length > 500 ? next.slice(-500) : next;
+      });
+    }));
 
     return ()=>{subs.forEach(p=>p.then(fn=>fn()));};
   },[authState?.valid,showToast]);
@@ -1742,7 +2102,7 @@ export default function App() {
   // ── Save bus config ───────────────────────────────────────────────────────
   const handleSaveBusConfig = useCallback(async (devices:DeviceConfig[])=>{
     try {
-      const confirmed = await invoke<DeviceConfig[]>("apply_bus_config",{devices});
+      const confirmed = await invokeApi<DeviceConfig[]>("apply_bus_config",{devices});
       setConfiguredDevices(confirmed);
       // Auto-select first tab
       if(confirmed.length>0)setActiveTab(confirmed[0].device_name);
@@ -1758,19 +2118,19 @@ export default function App() {
   const handleTogglePoll = useCallback(async ()=>{
     if(configuredDevices.length===0){showToast("Configure bus devices first.","warn");return;}
     try {
-      const s=await invoke<PollState>("toggle_polling",{comPort:comPort.trim()});
+      const s=await invokeApi<PollState>("toggle_polling",{});
       setPollState(s);
       showToast(s==="running"
-        ?`Polling ${configuredDevices.length} device(s) on ${comPort}`
+        ?`Polling ${configuredDevices.length} device(s)`
         :"Polling stopped",
         s==="running"?"success":"warn");
     } catch(e){showToast(`Error: ${e}`,"error");}
-  },[comPort,configuredDevices,showToast]);
+  },[configuredDevices,showToast]);
 
   // ── Clear ─────────────────────────────────────────────────────────────────
   const handleClear = useCallback(async ()=>{
     try {
-      const n=await invoke<number>("clear_history");
+      const n=await invokeApi<number>("clear_history");
       setLatestByDevice({});setHistoryByDevice({});
       showToast(`Cleared ${n.toLocaleString()} records`,"warn");
     } catch(e){showToast(`Clear failed: ${e}`,"error");}
@@ -1789,13 +2149,15 @@ export default function App() {
       : `technidaq_all_${rangeLabel}_${dateSuffix}.xlsx`;
     try {
       setExportStatus("saving");
+      if (!isTauri) { setExportStatus("error"); setTimeout(()=>setExportStatus("idle"),2500); return; }
+      const { save } = await import("@tauri-apps/plugin-dialog");
       const fp = await save({
         title: target ? `Export — ${target}` : "Export All Meters",
         defaultPath: defaultName,
         filters:[{name:"Excel Workbook",extensions:["xlsx"]}],
       });
       if(!fp){setExportStatus("idle");return;}
-      const n = await invoke<number>("export_to_excel",{
+      const n = await invokeApi<number>("export_to_excel",{
         path:              fp,
         targetDevice:      target ?? null,
         timeRangeSeconds:  timeRange ?? null,
@@ -1818,7 +2180,7 @@ export default function App() {
   const handleLogout = useCallback(async ()=>{
     setLogoutBusy(true);
     try {
-      await invoke("logout_user");
+      await invokeApi("logout_user");
       // Reset all runtime state — history intentionally preserved in DB
       setAuthState({valid:false, allowed_meters:[]});
       setConfiguredDevices([]);
@@ -1837,6 +2199,15 @@ export default function App() {
 
   // ── Simulation flag ───────────────────────────────────────────────────────
   const isSimulation = authState?.allowed_meters.includes("Simulation") ?? false;
+
+  // ── Diagnostics flag ──────────────────────────────────────────────────────
+  const hasDiagnostics = authState?.allowed_meters.includes("Diagnostics") ?? false;
+
+  // ── Enable/disable diagnostics when terminal is toggled ───────────────────
+  useEffect(()=>{
+    if (!authState?.valid) return;
+    invokeApi("set_diagnostics_enabled", { enabled: showTerminal }).catch(console.error);
+  }, [showTerminal, authState?.valid]);
 
   // ── Active tab device ─────────────────────────────────────────────────────
   const activeDevice = configuredDevices.find(d=>d.device_name===activeTab);
@@ -1894,13 +2265,14 @@ export default function App() {
         onThemeToggle={()=>setTheme(t=>t==="dark"?"light":"dark")}
         onTogglePoll={handleTogglePoll} onClear={handleClear}
         onExport={handleExport} exportStatus={exportStatus}
-        comPort={comPort} onComPortChange={setComPort}
         username={authState?.username??""}
         projectName={authState?.project_name??""}
         onLogout={()=>setShowLogout(true)}
         configuredDevices={configuredDevices}
         activeDeviceName={activeDevice?.device_name}
         isSimulation={isSimulation}
+        onOpenTerminal={()=>setShowTerminal(t=>!t)}
+        hasDiagnostics={hasDiagnostics}
       />
 
       <BusBar
@@ -1982,13 +2354,20 @@ export default function App() {
               gridTemplateColumns:"repeat(auto-fill, minmax(160px, 1fr))",
               gap:"10px",
             }}>
-              {activeDevice.selected_registers.map((reg,i)=>(
-                <MetricCard
-                  key={reg.name} name={reg.name}
-                  value={activeLatest[reg.name]}
-                  idx={i} isDark={isDark}
-                />
-              ))}
+              {activeDevice.selected_registers.map((reg,i)=>{
+                const sparkData = activeHistory.map(pt=>typeof pt[reg.name]==="number" ? pt[reg.name] as number : NaN)
+                                               .filter(v=>!isNaN(v)).slice(-20);
+                return (
+                  <MetricCard
+                    key={reg.name} name={reg.name}
+                    value={activeLatest[reg.name]}
+                    idx={i} isDark={isDark}
+                    sparkData={sparkData}
+                    minAlarm={reg.min_alarm}
+                    maxAlarm={reg.max_alarm}
+                  />
+                );
+              })}
             </div>
 
             {/* ── Timeframe selector ───────────────────────────────────── */}
@@ -2067,10 +2446,12 @@ export default function App() {
         }}>
           {[
             {label:"Device",  value:activeDevice?.device_name??"—"},
-            {label:"COM Port",value:isSimulation?"SIM":comPort,
+            {label:"Protocol",   value:isSimulation?"SIM":activeDevice?.protocol?.toUpperCase()??"—",
               color:isSimulation?CLR.amber:undefined},
-            {label:"Baud",    value:isSimulation?"—":activeDevice
-              ? (profiles.find(p=>p.model===activeDevice.meter_model)?.baud_rate.toLocaleString()??"—")
+            {label:"Connection", value:isSimulation?"—":activeDevice
+              ? (activeDevice.protocol==="tcp"
+                  ? `${activeDevice.ip_address}:${activeDevice.tcp_port}`
+                  : `${activeDevice.com_port} / ${activeDevice.baud_rate}`)
               : "—"},
             {label:"Engine",  value:isSimulation&&pollState==="running"?"SIMULATION":pollState.toUpperCase(),
               color:isSimulation&&pollState==="running"?CLR.amber:pollState==="running"?CLR.green:pollState==="fault"?CLR.red:CLR.text3(isDark)},
@@ -2090,6 +2471,10 @@ export default function App() {
         </div>
 
       </main>
+
+      {showTerminal && (
+        <DiagTerminal lines={diagLines} onClose={()=>setShowTerminal(false)} isDark={isDark}/>
+      )}
     </div>
   );
 }

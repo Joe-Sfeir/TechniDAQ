@@ -119,7 +119,7 @@ function main() {
     allowed_meters = meters.split(",").map(s => s.trim()).filter(Boolean);
     if (profileKeys) {
       for (const m of allowed_meters) {
-        if (m !== "Custom" && m !== "Simulation" && !profileKeys.includes(m)) {
+        if (m !== "Custom" && m !== "Simulation" && m !== "EmailAlerts" && m !== "Diagnostics" && !profileKeys.includes(m)) {
           console.warn(`[warn] "${m}" not found in profiles.json — ignored at runtime.`);
         }
       }

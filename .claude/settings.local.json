@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python - <<'EOF'\nfrom PIL import Image\n\nsrc = r\"C:\\\\Users\\\\Joe\\\\Desktop\\\\powermeter-demo\\\\powermeter-demo\\\\src\\\\assets\\\\logo.png\"\nout = r\"C:\\\\Users\\\\Joe\\\\Desktop\\\\powermeter-demo\\\\powermeter-demo\\\\src\\\\assets\\\\logo_square.png\"\n\nimg = Image.open\\(src\\).convert\\(\"RGBA\"\\)\nw, h = img.size\nsize = max\\(w, h\\)\n\nsquare = Image.new\\(\"RGBA\", \\(size, size\\), \\(255, 255, 255, 0\\)\\)\nsquare.paste\\(img, \\(\\(size - w\\) // 2, \\(size - h\\) // 2\\)\\)\nsquare.save\\(out\\)\nprint\\(f\"Saved {size}x{size} square to {out}\"\\)\nEOF)",
+      "Bash(cd \"C:\\\\Users\\\\Joe\\\\Desktop\\\\powermeter-demo\\\\powermeter-demo\\\\src-tauri\" && cargo check 2>&1)",
+      "Bash(cd \"C:\\\\Users\\\\Joe\\\\Desktop\\\\powermeter-demo\\\\powermeter-demo\" && npx tsc --noEmit 2>&1 | head -60)",
+      "Bash(cd \"C:\\\\Users\\\\Joe\\\\Desktop\\\\powermeter-demo\\\\powermeter-demo\" && npx tsc --noEmit 2>&1)",
+      "Bash(python - <<'EOF'\nfrom PIL import Image, ImageChops\n\nsrc = r\"C:\\\\Users\\\\Joe\\\\Desktop\\\\powermeter-demo\\\\powermeter-demo\\\\src\\\\assets\\\\logo.png\"\nimg = Image.open\\(src\\).convert\\(\"RGBA\"\\)\n\n# Split out alpha; if no alpha, use white-background diff\nr, g, b, a = img.split\\(\\)\n# Create a white background version and diff to find non-white pixels\nbg = Image.new\\(\"RGBA\", img.size, \\(255, 255, 255, 255\\)\\)\ndiff = ImageChops.difference\\(img.convert\\(\"RGB\"\\), bg.convert\\(\"RGB\"\\)\\)\nbbox = diff.getbbox\\(\\)\nprint\\(f\"Original: {img.size}, Content bbox: {bbox}\"\\)\n\nif bbox:\n    # Add a small padding of 8px\n    pad = 8\n    x1 = max\\(0, bbox[0] - pad\\)\n    y1 = max\\(0, bbox[1] - pad\\)\n    x2 = min\\(img.width,  bbox[2] + pad\\)\n    y2 = min\\(img.height, bbox[3] + pad\\)\n    cropped = img.crop\\(\\(x1, y1, x2, y2\\)\\)\n    cropped.save\\(src\\)\n    print\\(f\"Saved cropped: {cropped.size}\"\\)\nEOF)",
+      "Bash(cd \"C:\\\\Users\\\\Joe\\\\Desktop\\\\powermeter-demo\\\\powermeter-demo\" && npm run build 2>&1)",
+      "Bash(cd \"C:\\\\Users\\\\Joe\\\\Desktop\\\\powermeter-demo\\\\powermeter-demo\\\\src-tauri\" && cargo tree -p rust_xlsxwriter 2>&1 | head -5 && grep \"rust_xlsxwriter\" Cargo.toml)",
+      "Bash(cd \"C:\\\\Users\\\\Joe\\\\Desktop\\\\powermeter-demo\\\\powermeter-demo\\\\src-tauri\" && cargo doc --no-deps -p rust_xlsxwriter 2>&1 | tail -5 && grep -r \"Shape\\\\|TextBox\\\\|textbox\\\\|shape\" target/doc/rust_xlsxwriter/ 2>/dev/null | head -10 || echo \"no doc output\")",
+      "Bash(cd C:/Users/Joe/Desktop/powermeter-demo/powermeter-demo && npm run build 2>&1)",
+      "Bash(cd C:/Users/Joe/Desktop/powermeter-demo/powermeter-demo/src-tauri && cargo check 2>&1)",
+      "Bash(cd C:/Users/Joe/Desktop/powermeter-demo/powermeter-demo/src-tauri && find target/doc/rust_xlsxwriter -name \"*.html\" | xargs grep -l \"Shape\\\\|shape\" 2>/dev/null | grep -v \"chart\\\\|conditional\\\\|marker\" | head -20)",
+      "Bash(cd C:/Users/Joe/Desktop/powermeter-demo/powermeter-demo/src-tauri && find target/doc/rust_xlsxwriter -name \"*.html\" | xargs grep -l \"textbox\\\\|insert_shape\\\\|ShapeFont\\\\|ShapeFormat\\\\|no_fill\\\\|no_line\" 2>/dev/null | head -20)",
+      "Bash(cd C:/Users/Joe/Desktop/powermeter-demo/powermeter-demo/src-tauri && cargo add rust_xlsxwriter@0.94 --dry-run 2>&1 | head -5; grep \"set_rotation\\\\|rotation\" /c/Users/Joe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust_xlsxwriter-0.80.0/src/shape.rs 2>/dev/null | grep \"pub fn\" | head -10)",
+      "Bash(find /c/Users/Joe/.cargo/registry/src -name \"shape.rs\" -path \"*/rust_xlsxwriter*\" 2>/dev/null | sort)",
+      "Bash(grep \"^pub use\\\\|^pub mod\" /c/Users/Joe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust_xlsxwriter-0.80.0/src/rust_xlsxwriter.rs 2>/dev/null | grep -i \"shape\\\\|protect\" | head -20 || grep \"^pub use\\\\|^pub mod\" /c/Users/Joe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust_xlsxwriter-0.80.0/src/*.rs 2>/dev/null | grep -i \"shape\\\\|protect\" | head -20)",
+      "Bash(find \"C:/Users/Joe/.cargo/registry/src\" -path \"*/rust_xlsxwriter-0.80.0/src/shape.rs\" 2>/dev/null | head -1 | xargs grep -A 20 \"struct ShapeText\" 2>/dev/null || grep -r \"ShapeText\" \"C:/Users/Joe/.cargo/registry/src\" --include=\"*.rs\" -l 2>/dev/null | grep \"rust_xlsxwriter-0.80.0\" | head -3)",
+      "Bash(grep -A 10 \"fn set_direction\" \"C:/Users/Joe/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rust_xlsxwriter-0.80.0/src/shape.rs\" 2>/dev/null || find \"C:/Users/Joe/.cargo/registry/src\" -path \"*/rust_xlsxwriter-0.80.0/src/shape.rs\" -exec grep -n \"direction\\\\|ShapeText\" {} \\\\; 2>/dev/null | head -30)",
+      "Bash(cd \"C:/Users/Joe/Desktop/powermeter-demo/powermeter-demo\" && npx tsc --noEmit 2>&1)",
+      "Bash(grep -n \"TAURI_INTERNALS\\\\|__TAURI__\" \"C:/Users/Joe/Desktop/powermeter-demo/powermeter-demo/node_modules/@tauri-apps/api/core.js\" 2>/dev/null | head -5\ngrep -n \"TAURI_INTERNALS\\\\|__TAURI__\" \"C:/Users/Joe/Desktop/powermeter-demo/powermeter-demo/node_modules/@tauri-apps/plugin-dialog/dist-js/index.js\" 2>/dev/null | head -5)",
+      "Bash(cd \"C:/Users/Joe/Desktop/powermeter-demo/powermeter-demo/src-tauri\" && cargo check 2>&1 && echo \"RUST OK\")",
+      "Bash(cd \"C:/Users/Joe/Desktop/powermeter-demo/powermeter-demo\" && npx tsc --noEmit 2>&1 && echo \"TS OK\")"
+    ]
+  }
+}
