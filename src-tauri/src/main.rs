@@ -10,7 +10,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Timelike;
+#[cfg(feature = "cloud_sync")]
 use lettre::{message::header::ContentType, transport::smtp::authentication::Credentials, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+#[cfg(feature = "cloud_sync")]
+use reqwest::Client as HttpClient;
 use rusqlite::{params, Connection};
 use rust_xlsxwriter::{Color, DocProperties, Format, FormatAlign, FormatBorder, Image, ProtectionOptions, Shape, ShapeFont, ShapeFormat, ShapeText, ShapeTextDirection, Workbook};
 use serde::{Deserialize, Serialize};
@@ -22,12 +25,15 @@ use tauri::{
 use axum::{
     body::Body,
     extract::{Json, Path, State as AxumState},
+    extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     http::{header, StatusCode, Uri},
-    response::Response,
-    routing::post,
+    response::{IntoResponse, Response},
+    routing::{get, post},
     Router,
 };
+use tokio::sync::mpsc::UnboundedSender;
 use rust_embed::RustEmbed;
+#[cfg(feature = "cloud_sync")]
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tokio_modbus::prelude::*;
@@ -36,9 +42,14 @@ use tokio_serial::SerialStream;
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MASTER_KEY_HEX:       &str = "6f3d9a2e1b8c4f7a0e5d2b9c6a3f1e8d4b7c0a9e2f5d8b1c4a7e0f3d6b9c2a5f";
-const SMTP_HOST: &str = "smtp.gmail.com";   // fill in: e.g. "smtp.gmail.com"
-const SMTP_USER: &str = "joesfeir007@gmail.com";   // fill in: e.g. "alerts@company.com"
-const SMTP_PASS: &str = "drrx vrdk elac oprp";   // fill in: app password
+#[cfg(feature = "cloud_sync")]
+const CLOUD_API_URL: &str = "https://api.technicat.cloud";
+#[cfg(feature = "cloud_sync")]
+const SMTP_HOST: &str = "smtp.gmail.com";
+#[cfg(feature = "cloud_sync")]
+const SMTP_USER: &str = "joesfeir007@gmail.com";
+#[cfg(feature = "cloud_sync")]
+const SMTP_PASS: &str = "drrx vrdk elac oprp";
 const PORT_TIMEOUT_MS:      u64  = 500;
 /// Minimum gap between consecutive Modbus frames on the same RS485 bus (turnaround time).
 const RS485_TURNAROUND_MS:  u64  = 25;
@@ -122,6 +133,35 @@ pub struct DbConnection(pub Arc<Mutex<Connection>>);
 /// Shared mutable copy of the profile library loaded from profiles.json.
 pub struct ProfilesState(pub Arc<Mutex<HashMap<String, MeterProfileEntry>>>);
 
+// ─── WebSocket Client Registry ────────────────────────────────────────────────
+
+/// One unbounded-sender per connected web client.  Sending fails on a closed
+/// socket; the broadcast helper uses `retain` to prune dead entries automatically.
+type WsClientList = Arc<Mutex<Vec<UnboundedSender<String>>>>;
+
+/// Tauri-managed wrapper so Tauri commands can also reach the WS client list.
+pub struct WsClients(WsClientList);
+
+/// Serialise the current engine state into a STATE_CHANGE WebSocket frame.
+fn build_state_msg(engine: &Arc<Mutex<EngineState>>) -> String {
+    if let Ok(eng) = engine.lock() {
+        serde_json::json!({
+            "type":               "STATE_CHANGE",
+            "configured_devices": eng.configured_devices,
+            "poll_state":         eng.poll,
+        }).to_string()
+    } else {
+        r#"{"type":"STATE_CHANGE","configured_devices":[],"poll_state":"stopped"}"#.to_string()
+    }
+}
+
+/// Broadcast a message to every connected web client, dropping dead connections.
+fn ws_broadcast(clients: &WsClientList, msg: String) {
+    if let Ok(mut list) = clients.lock() {
+        list.retain(|tx| tx.send(msg.clone()).is_ok());
+    }
+}
+
 // ─── Event Payloads ───────────────────────────────────────────────────────────
 
 #[derive(Serialize, Clone, Debug)]
@@ -169,11 +209,17 @@ impl ConnKey {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct AuthState {
-    pub valid:          bool,
-    pub username:       Option<String>,
-    pub project_name:   Option<String>,
-    pub expiry_date:    Option<i64>,
-    pub allowed_meters: Vec<String>,
+    pub valid:             bool,
+    pub username:          Option<String>,
+    pub project_name:      Option<String>,
+    pub expiry_date:       Option<i64>,
+    pub allowed_meters:    Vec<String>,
+    pub mode:              Option<String>,
+    pub tier:              Option<u8>,
+    pub protocols:         Option<String>,
+    /// True when a `machine_api_key` has been obtained from the cloud.
+    /// Always false in offline/air-gapped builds.
+    pub cloud_registered:  bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -185,7 +231,17 @@ struct LicensePayload {
     username:       String,
     project_name:   String,
     allowed_meters: Vec<String>,
+    #[serde(default = "default_mode")]
+    mode:           String,
+    #[serde(default = "default_tier")]
+    tier:           u8,
+    #[serde(default = "default_protocols")]
+    protocols:      String,
 }
+
+fn default_mode()      -> String { "offline".into() }
+fn default_tier()      -> u8     { 1 }
+fn default_protocols() -> String { "All".into() }
 
 // ─── External Profile Library ─────────────────────────────────────────────────
 
@@ -303,8 +359,29 @@ fn decrypt_license_token(token: &str) -> Result<LicensePayload, String> {
     serde_json::from_slice(&plaintext).map_err(|e| format!("Payload corrupt: {e}"))
 }
 
-/// Read `allowed_meters` from the DB without holding the lock long.
+/// Read or generate a stable machine identifier, stored in `app_config`.
+/// Used as a stable edge-unit identity in cloud API calls.
+#[cfg(feature = "cloud_sync")]
+fn get_or_create_machine_id(conn: &Connection) -> String {
+    if let Ok(id) = conn.query_row(
+        "SELECT value FROM app_config WHERE key = 'machine_id'",
+        [],
+        |r| r.get::<_, String>(0),
+    ) {
+        return id;
+    }
+    // Derive a unique ID from current timestamp (ns) + OS process ID.
+    // Stored permanently in app_config so it never changes after first run.
+    let id = format!("edge-{:016x}{:08x}", now_ms(), std::process::id());
+    let _  = conn.execute(
+        "INSERT OR IGNORE INTO app_config (key, value) VALUES ('machine_id', ?1)",
+        params![&id],
+    );
+    eprintln!("[cloud] New machine_id generated: {id}");
+    id
+}
 
+/// Read `allowed_meters` from the DB without holding the lock long.
 fn get_allowed_meters_from_db(db: &Arc<Mutex<Connection>>) -> Vec<String> {
     let conn = db.lock().unwrap();
     conn.query_row("SELECT allowed_meters FROM settings LIMIT 1", [],
@@ -312,6 +389,14 @@ fn get_allowed_meters_from_db(db: &Arc<Mutex<Connection>>) -> Vec<String> {
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
         .unwrap_or_default()
+}
+
+/// Read `protocols` from the DB ("RTU", "TCP", or "All"). Defaults to "All".
+fn get_license_protocols_from_db(db: &Arc<Mutex<Connection>>) -> String {
+    let conn = db.lock().unwrap();
+    conn.query_row("SELECT protocols FROM settings LIMIT 1", [],
+        |r| r.get::<_, String>(0))
+        .unwrap_or_else(|_| "All".into())
 }
 
 /// Generate a plausible oscillating mock value for a named register.
@@ -349,6 +434,7 @@ fn is_license_valid(db: &Arc<Mutex<Connection>>) -> bool {
 fn toggle_polling(
     engine:     State<SharedEngine>,
     app_handle: tauri::AppHandle,
+    ws:         State<WsClients>,
 ) -> Result<PollState, String> {
     let new_state = {
         let mut e = engine.0.lock().map_err(|e| e.to_string())?;
@@ -357,6 +443,7 @@ fn toggle_polling(
     };
     app_handle.emit("status-changed", StatusEvent { state: new_state.clone() })
         .map_err(|e| e.to_string())?;
+    ws_broadcast(&ws.0, build_state_msg(&engine.0));
     Ok(new_state)
 }
 
@@ -366,7 +453,38 @@ fn get_status(engine: State<SharedEngine>) -> Result<PollState, String> {
 }
 
 #[tauri::command]
-fn logout_user(db: State<DbConnection>) -> Result<(), String> {
+async fn logout_user(db: State<'_, DbConnection>) -> Result<(), String> {
+    // ── Cloud key invalidation (fire-and-forget, non-blocking) ────────────────
+    #[cfg(feature = "cloud_sync")]
+    {
+        let result: Option<(String, String)> = {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            conn.query_row(
+                "SELECT mode, machine_api_key FROM settings LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            ).ok()
+        };
+        if let Some((mode, api_key)) = result {
+            if mode == "online" && !api_key.is_empty() {
+                tokio::spawn(async move {
+                    let client = HttpClient::builder()
+                        .timeout(Duration::from_secs(5))
+                        .https_only(true)
+                        .build()
+                        .unwrap_or_else(|_| HttpClient::new());
+                    let _ = client
+                        .post(format!("{CLOUD_API_URL}/api/machine/logout"))
+                        .bearer_auth(&api_key)
+                        .send()
+                        .await;
+                    eprintln!("[logout] ✔ Cloud key invalidation sent");
+                });
+            }
+        }
+    }
+
+    // Always wipe local settings regardless of cloud outcome
     db.0.lock().map_err(|e| e.to_string())?
        .execute("DELETE FROM settings", []).map_err(|e| e.to_string())?;
     eprintln!("[auth] License revoked — settings cleared, history preserved.");
@@ -732,14 +850,26 @@ fn export_to_excel(
     do_export(&conn, &path, target_device.as_deref(), ts_from.as_deref(), None, &username, &project_name)
 }
 
+// ─── Tauri Commands ── Build Info ─────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct BuildInfo {
+    is_cloud_build: bool,
+}
+
+#[tauri::command]
+fn get_build_info() -> BuildInfo {
+    BuildInfo { is_cloud_build: cfg!(feature = "cloud_sync") }
+}
+
 // ─── Tauri Commands ── License ────────────────────────────────────────────────
 
 #[tauri::command]
-fn activate_license(
+async fn activate_license(
     key:          String,
     username:     String,
     project_name: String,
-    db:           State<DbConnection>,
+    db:           State<'_, DbConnection>,
 ) -> Result<String, String> {
     eprintln!("[license] activate_license called — user='{}' project='{}'",
               username.trim(), project_name.trim());
@@ -785,25 +915,74 @@ fn activate_license(
     let expiry_date = (payload.created_at + payload.duration_days * 86_400) as i64;
     let meters_json = serde_json::to_string(&payload.allowed_meters).map_err(|e| e.to_string())?;
 
-    eprintln!("[license] writing to DB — expiry_date={expiry_date} meters={meters_json}");
-    let conn = db.0.lock().map_err(|e| {
-        eprintln!("[license] ❌ DB lock failed: {e}");
-        e.to_string()
-    })?;
-    conn.execute("DELETE FROM settings", []).map_err(|e| {
-        eprintln!("[license] ❌ DELETE settings failed: {e}");
-        e.to_string()
-    })?;
-    conn.execute(
-        "INSERT INTO settings (username, project_name, expiry_date, allowed_meters) VALUES (?1,?2,?3,?4)",
-        params![username.trim(), project_name.trim(), expiry_date, meters_json],
-    ).map_err(|e| {
-        eprintln!("[license] ❌ INSERT settings failed: {e}");
-        e.to_string()
-    })?;
+    eprintln!("[license] writing to DB — expiry_date={expiry_date} meters={meters_json} mode={} tier={} protocols={}",
+              payload.mode, payload.tier, payload.protocols);
+    {
+        let conn = db.0.lock().map_err(|e| {
+            eprintln!("[license] ❌ DB lock failed: {e}");
+            e.to_string()
+        })?;
+        conn.execute("DELETE FROM settings", []).map_err(|e| {
+            eprintln!("[license] ❌ DELETE settings failed: {e}");
+            e.to_string()
+        })?;
+        conn.execute(
+            "INSERT INTO settings (username, project_name, expiry_date, allowed_meters, mode, tier, protocols, machine_api_key) VALUES (?1,?2,?3,?4,?5,?6,?7,'')",
+            params![username.trim(), project_name.trim(), expiry_date, meters_json,
+                    payload.mode, payload.tier as i64, payload.protocols],
+        ).map_err(|e| {
+            eprintln!("[license] ❌ INSERT settings failed: {e}");
+            e.to_string()
+        })?;
+    } // ← DB lock released before any async work
 
-    let msg = format!("License activated for {} / {}. Valid {} days.",
-        username.trim(), project_name.trim(), payload.duration_days);
+    // ── Cloud Handshake (online mode only, cloud build only) ──────────────────
+    #[cfg(feature = "cloud_sync")]
+    if payload.mode == "online" {
+        let machine_id = {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            get_or_create_machine_id(&conn)
+        };
+        let client = HttpClient::builder()
+            .timeout(Duration::from_secs(15))
+            .https_only(true)
+            .build()
+            .map_err(|e| format!("HTTP client error: {e}"))?;
+        let resp = client
+            .post(format!("{CLOUD_API_URL}/api/machine/activate"))
+            .json(&serde_json::json!({
+                "license_key":  key,
+                "username":     username.trim(),
+                "project_name": project_name.trim(),
+                "machine_id":   machine_id,
+                "tier":         payload.tier,
+                "protocols":    payload.protocols,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Cloud activation request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body   = resp.text().await.unwrap_or_default();
+            return Err(format!("Cloud rejected activation: HTTP {status} — {body}"));
+        }
+        let json: serde_json::Value = resp.json().await
+            .map_err(|e| format!("Cloud response parse error: {e}"))?;
+        let api_key = json["machine_api_key"]
+            .as_str()
+            .ok_or_else(|| "Cloud response missing machine_api_key field".to_string())?
+            .to_string();
+        {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            conn.execute("UPDATE settings SET machine_api_key = ?1", params![api_key])
+                .map_err(|e| format!("Failed to store machine_api_key: {e}"))?;
+        }
+        eprintln!("[license] ✔ Cloud handshake complete — machine registered with cloud");
+    }
+
+    let msg = format!("License activated for {} / {}. Valid {} days. Mode={} Tier={} Protocols={}.",
+        username.trim(), project_name.trim(), payload.duration_days,
+        payload.mode, payload.tier, payload.protocols);
     eprintln!("[license] ✔ {msg}");
     Ok(msg)
 }
@@ -813,14 +992,29 @@ fn get_auth_state(db: State<DbConnection>) -> Result<AuthState, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let now  = now_secs() as i64;
     match conn.query_row(
-        "SELECT username, project_name, expiry_date, allowed_meters FROM settings LIMIT 1", [],
-        |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,String>(3)?)),
+        "SELECT username, project_name, expiry_date, allowed_meters, mode, tier, protocols, machine_api_key FROM settings LIMIT 1", [],
+        |r| Ok((
+            r.get::<_,String>(0)?, r.get::<_,String>(1)?,
+            r.get::<_,i64>(2)?,   r.get::<_,String>(3)?,
+            r.get::<_,String>(4).unwrap_or_else(|_| "offline".into()),
+            r.get::<_,i64>(5).unwrap_or(1),
+            r.get::<_,String>(6).unwrap_or_else(|_| "All".into()),
+            r.get::<_,String>(7).unwrap_or_default(),
+        )),
     ) {
-        Ok((u, p, exp, m)) if now < exp => Ok(AuthState {
+        Ok((u, p, exp, m, mode, tier, protocols, api_key)) if now < exp => Ok(AuthState {
             valid: true, username: Some(u), project_name: Some(p), expiry_date: Some(exp),
-            allowed_meters: serde_json::from_str(&m).unwrap_or_default(),
+            allowed_meters:   serde_json::from_str(&m).unwrap_or_default(),
+            mode:             Some(mode),
+            tier:             Some(tier as u8),
+            protocols:        Some(protocols),
+            cloud_registered: !api_key.is_empty(),
         }),
-        _ => Ok(AuthState { valid:false, username:None, project_name:None, expiry_date:None, allowed_meters:vec![] }),
+        _ => Ok(AuthState {
+            valid: false, username: None, project_name: None, expiry_date: None,
+            allowed_meters: vec![], mode: None, tier: None, protocols: None,
+            cloud_registered: false,
+        }),
     }
 }
 
@@ -874,6 +1068,7 @@ fn apply_bus_config(
     devices:        Vec<DeviceConfig>,
     profiles_state: State<ProfilesState>,
     engine:         State<SharedEngine>,
+    ws:             State<WsClients>,
 ) -> Result<Vec<DeviceConfig>, String> {
     if devices.is_empty() { return Err("At least one device must be configured.".into()); }
 
@@ -911,6 +1106,7 @@ fn apply_bus_config(
         eng.configured_devices = devices.clone();
     }
     eprintln!("[engine] Bus config: {} devices, {} total registers", devices.len(), total_regs);
+    ws_broadcast(&ws.0, build_state_msg(&engine.0));
     Ok(devices)
 }
 
@@ -970,6 +1166,7 @@ fn modbus_request_hex(slave: u8, address: u16, count: u16) -> String {
     fmt_hex(&frame)
 }
 
+#[cfg(feature = "cloud_sync")]
 async fn send_alarm_email(dest: &str, device: &str, reg: &str, value: f64, breach: &str) {
     if SMTP_HOST.is_empty() || SMTP_USER.is_empty() || dest.is_empty() { return; }
     // Connectivity probe
@@ -1004,6 +1201,11 @@ async fn send_alarm_email(dest: &str, device: &str, reg: &str, value: f64, breac
         Ok(_)  => eprintln!("[email] Alarm sent → {dest}"),
         Err(e) => eprintln!("[email] Send failed: {e}"),
     }
+}
+
+#[cfg(not(feature = "cloud_sync"))]
+async fn send_alarm_email(_dest: &str, _device: &str, _reg: &str, _value: f64, _breach: &str) {
+    eprintln!("[email] Disabled in Air-Gapped build — recompile with --features cloud_sync to enable.");
 }
 
 // ─── Per-device Connection Factory ───────────────────────────────────────────
@@ -1049,11 +1251,12 @@ async fn try_connect(
 // ─── Multi-Device RS485 Polling Loop ─────────────────────────────────────────
 
 async fn run_polling_loop(
-    engine:   Arc<Mutex<EngineState>>,
-    db:       Arc<Mutex<Connection>>,
-    profiles: Arc<Mutex<HashMap<String, MeterProfileEntry>>>,
-    app:      tauri::AppHandle,
-    diag:     Arc<AtomicBool>,
+    engine:     Arc<Mutex<EngineState>>,
+    db:         Arc<Mutex<Connection>>,
+    profiles:   Arc<Mutex<HashMap<String, MeterProfileEntry>>>,
+    app:        tauri::AppHandle,
+    diag:       Arc<AtomicBool>,
+    ws_clients: WsClientList,
 ) {
     let mut last_polled:       HashMap<String, Instant>                        = HashMap::new();
     let mut email_debounce:    HashMap<String, Instant>                        = HashMap::new();
@@ -1119,12 +1322,21 @@ async fn run_polling_loop(
                         params![wall_clock_iso(), &device.device_name, &device_id, &data_json],
                     ) { eprintln!("[sim] INSERT: {e}"); }
                 }
+                let ts = now_ms();
+                let ws_frame = serde_json::json!({
+                    "type": "METER_DATA",
+                    "device_name": &device.device_name,
+                    "device_id": &device_id,
+                    "timestamp_ms": ts,
+                    "data": &data,
+                }).to_string();
                 let _ = app.emit("meter-data", MeterReading {
                     device_name: device.device_name.clone(),
                     device_id,
-                    timestamp_ms: now_ms(),
+                    timestamp_ms: ts,
                     data: data.clone(),
                 });
+                ws_broadcast(&ws_clients, ws_frame);
                 last_polled.insert(device.device_name.clone(), Instant::now());
 
                 // Alarm check
@@ -1193,7 +1405,32 @@ async fn run_polling_loop(
         // ── Real-hardware poll cycle ──────────────────────────────────────
         let tick_start = Instant::now();
 
+        // Read protocol restriction once per tick (cheap — only one DB read).
+        let license_protocols = get_license_protocols_from_db(&db);
+
         for device in &devices {
+            // ── License protocol gate ─────────────────────────────────────
+            let protocol_blocked = match license_protocols.as_str() {
+                "RTU" => matches!(device.protocol, Protocol::Tcp),
+                "TCP" => matches!(device.protocol, Protocol::Rtu),
+                _     => false, // "All" — no restriction
+            };
+            if protocol_blocked {
+                let proto_name = match device.protocol { Protocol::Rtu => "RTU", Protocol::Tcp => "TCP" };
+                let reason = format!(
+                    "License Fault: '{}' protocol not permitted — license restricts to {} only",
+                    proto_name, license_protocols
+                );
+                eprintln!("[license] ⛔ {} — {reason}", device.device_name);
+                let _ = app.emit("meter-fault", FaultEvent {
+                    device_name: device.device_name.clone(),
+                    reason,
+                    timestamp_ms: now_ms(),
+                });
+                last_polled.insert(device.device_name.clone(), Instant::now());
+                continue;
+            }
+
             // Is this device due for a poll?
             let elapsed = last_polled.get(&device.device_name)
                 .map(|t| t.elapsed().as_millis())
@@ -1265,12 +1502,21 @@ async fn run_polling_loop(
                         ) { eprintln!("[db] INSERT: {e}"); }
                     }
 
+                    let ts = now_ms();
+                    let ws_frame = serde_json::json!({
+                        "type": "METER_DATA",
+                        "device_name": &device.device_name,
+                        "device_id": &device_id,
+                        "timestamp_ms": ts,
+                        "data": &data,
+                    }).to_string();
                     let _ = app.emit("meter-data", MeterReading {
                         device_name: device.device_name.clone(),
                         device_id,
-                        timestamp_ms: now_ms(),
+                        timestamp_ms: ts,
                         data: data.clone(),
                     });
+                    ws_broadcast(&ws_clients, ws_frame);
                     last_polled.insert(device.device_name.clone(), Instant::now());
 
                     // Alarm check
@@ -1462,6 +1708,110 @@ async fn run_nightly_loop(db: Arc<Mutex<Connection>>, db_path: Arc<PathBuf>) {
     }
 }
 
+// ─── Store & Forward Sync Loop ────────────────────────────────────────────────
+//
+// Ticks every 5 seconds.  On each tick:
+//   1. Read (mode, machine_api_key) from settings — skip if not online/registered.
+//   2. SELECT up to 500 unsynced rows from meter_history.
+//   3. POST the batch to [CLOUD_API_URL]/api/machine/ingest.
+//   4. On HTTP 200: mark rows synced = 1.
+//   5. Prune rows that are already synced AND older than 48 hours.
+//
+// This function is compiled ONLY in cloud builds (--features cloud_sync).
+
+#[cfg(feature = "cloud_sync")]
+async fn run_cloud_sync_loop(db: Arc<Mutex<Connection>>, client: HttpClient) {
+    loop {
+        sleep(Duration::from_secs(5)).await;
+
+        // ── Read license state (cheap, brief lock) ─────────────────────────
+        let (mode, api_key) = {
+            let conn = db.lock().unwrap();
+            match conn.query_row(
+                "SELECT mode, machine_api_key FROM settings LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            ) {
+                Ok(v)  => v,
+                Err(_) => continue, // no license active yet
+            }
+        };
+
+        if mode != "online" || api_key.is_empty() { continue; }
+
+        // ── 48-hour pruning of already-synced rows ─────────────────────────
+        // Uses our ISO timestamp format for correct string comparison.
+        {
+            let cutoff = secs_to_iso(now_secs().saturating_sub(172_800));
+            let conn = db.lock().unwrap();
+            let _ = conn.execute(
+                "DELETE FROM meter_history WHERE synced = 1 AND timestamp < ?1",
+                params![cutoff],
+            );
+        }
+
+        // ── Fetch unsynced batch ───────────────────────────────────────────
+        let rows: Vec<(i64, String, String, String, String)> = {
+            let conn = db.lock().unwrap();
+            let mut stmt = match conn.prepare(
+                "SELECT id, timestamp, device_name, device_id, data \
+                 FROM meter_history WHERE synced = 0 ORDER BY id ASC LIMIT 500"
+            ) {
+                Ok(s)  => s,
+                Err(e) => { eprintln!("[sync] prepare error: {e}"); continue; }
+            };
+            stmt.query_map([], |r| Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            )))
+            .unwrap_or_else(|_| Box::new(std::iter::empty()))
+            .filter_map(|r| r.ok())
+            .collect()
+        };
+
+        if rows.is_empty() { continue; }
+
+        let ids: Vec<i64>              = rows.iter().map(|(id, ..)| *id).collect();
+        let readings: Vec<serde_json::Value> = rows.iter().map(|(id, ts, dn, di, data)| {
+            serde_json::json!({
+                "id":          id,
+                "timestamp":   ts,
+                "device_name": dn,
+                "device_id":   di,
+                "data":        data,
+            })
+        }).collect();
+
+        // ── POST batch to cloud ────────────────────────────────────────────
+        let result = client
+            .post(format!("{CLOUD_API_URL}/api/machine/ingest"))
+            .bearer_auth(&api_key)
+            .json(&serde_json::json!({ "readings": readings }))
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                // Mark all rows in the batch as synced using safe integer list
+                let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+                let sql     = format!("UPDATE meter_history SET synced = 1 WHERE id IN ({id_list})");
+                let conn    = db.lock().unwrap();
+                let _       = conn.execute(&sql, []);
+                eprintln!("[sync] ✔ {} row(s) synced to cloud", ids.len());
+            }
+            Ok(resp) => {
+                eprintln!("[sync] ✗ HTTP {} — will retry next tick", resp.status());
+            }
+            Err(e) => {
+                eprintln!("[sync] ✗ network error: {e} — will retry");
+            }
+        }
+    }
+}
+
 // ─── Database Init ────────────────────────────────────────────────────────────
 
 fn init_database(conn: &Connection) -> rusqlite::Result<()> {
@@ -1469,32 +1819,50 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous  = NORMAL;
 
-        DROP TABLE IF EXISTS meter_history;
-        CREATE TABLE meter_history (
+        -- meter_history persists across restarts to support Store & Forward.
+        -- On first run this creates the table; on subsequent runs it is a no-op.
+        CREATE TABLE IF NOT EXISTS meter_history (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp   TEXT    NOT NULL,
             device_name TEXT    NOT NULL DEFAULT '',
             device_id   TEXT    NOT NULL DEFAULT '',
-            data        TEXT    NOT NULL DEFAULT '{}'
+            data        TEXT    NOT NULL DEFAULT '{}',
+            synced      INTEGER NOT NULL DEFAULT 0
         );
 
-        CREATE INDEX IF NOT EXISTS idx_mh_ts   ON meter_history (timestamp);
-        CREATE INDEX IF NOT EXISTS idx_mh_name ON meter_history (device_name);
+        CREATE INDEX IF NOT EXISTS idx_mh_ts     ON meter_history (timestamp);
+        CREATE INDEX IF NOT EXISTS idx_mh_name   ON meter_history (device_name);
+        CREATE INDEX IF NOT EXISTS idx_mh_synced ON meter_history (synced);
 
+        -- settings is always recreated: license state begins fresh each session.
         DROP TABLE IF EXISTS settings;
         CREATE TABLE settings (
-            id             INTEGER PRIMARY KEY,
-            username       TEXT    NOT NULL,
-            project_name   TEXT    NOT NULL,
-            expiry_date    INTEGER NOT NULL,
-            allowed_meters TEXT    NOT NULL
+            id               INTEGER PRIMARY KEY,
+            username         TEXT    NOT NULL,
+            project_name     TEXT    NOT NULL,
+            expiry_date      INTEGER NOT NULL,
+            allowed_meters   TEXT    NOT NULL,
+            mode             TEXT    NOT NULL DEFAULT 'offline',
+            tier             INTEGER NOT NULL DEFAULT 1,
+            protocols        TEXT    NOT NULL DEFAULT 'All',
+            machine_api_key  TEXT    NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS app_config (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT ''
         );
-    ")
+    ")?;
+
+    // Migration: add `synced` column to any pre-existing meter_history table
+    // that was created before this column existed.  SQLite returns an error if
+    // the column already exists; we intentionally ignore it.
+    let _ = conn.execute(
+        "ALTER TABLE meter_history ADD COLUMN synced INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
+    Ok(())
 }
 
 // ─── Axum Shared State ────────────────────────────────────────────────────────
@@ -1503,11 +1871,12 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
 /// handlers can read/write the same live data as the Tauri commands.
 #[derive(Clone)]
 struct AxumAppState {
-    db:       Arc<Mutex<Connection>>,
-    profiles: Arc<Mutex<HashMap<String, MeterProfileEntry>>>,
-    engine:   Arc<Mutex<EngineState>>,
-    app:      tauri::AppHandle,
-    diag:     Arc<AtomicBool>,
+    db:         Arc<Mutex<Connection>>,
+    profiles:   Arc<Mutex<HashMap<String, MeterProfileEntry>>>,
+    engine:     Arc<Mutex<EngineState>>,
+    app:        tauri::AppHandle,
+    diag:       Arc<AtomicBool>,
+    ws_clients: WsClientList,
 }
 
 // ─── REST API Dispatch ────────────────────────────────────────────────────────
@@ -1537,24 +1906,39 @@ async fn api_dispatch(
 
     match cmd.as_str() {
 
+        // ── Build info ────────────────────────────────────────────────────────
+        "get_build_info" => {
+            ok(serde_json::json!({ "is_cloud_build": cfg!(feature = "cloud_sync") }))
+        }
+
         // ── Auth ──────────────────────────────────────────────────────────────
         "get_auth_state" => {
             let conn = s.db.lock().map_err(api_e500)?;
             let now  = now_secs() as i64;
             let auth = match conn.query_row(
-                "SELECT username, project_name, expiry_date, allowed_meters FROM settings LIMIT 1",
+                "SELECT username, project_name, expiry_date, allowed_meters, mode, tier, protocols, machine_api_key FROM settings LIMIT 1",
                 [], |r: &rusqlite::Row<'_>| Ok((
                     r.get::<_,String>(0)?, r.get::<_,String>(1)?,
                     r.get::<_,i64>(2)?,   r.get::<_,String>(3)?,
+                    r.get::<_,String>(4).unwrap_or_else(|_| "offline".into()),
+                    r.get::<_,i64>(5).unwrap_or(1),
+                    r.get::<_,String>(6).unwrap_or_else(|_| "All".into()),
+                    r.get::<_,String>(7).unwrap_or_default(),
                 )),
             ) {
-                Ok((u, p, exp, m)) if now < exp => AuthState {
+                Ok((u, p, exp, m, mode, tier, protocols, api_key)) if now < exp => AuthState {
                     valid: true, username: Some(u), project_name: Some(p),
                     expiry_date: Some(exp),
-                    allowed_meters: serde_json::from_str(&m).unwrap_or_default(),
+                    allowed_meters:   serde_json::from_str(&m).unwrap_or_default(),
+                    mode:             Some(mode),
+                    tier:             Some(tier as u8),
+                    protocols:        Some(protocols),
+                    cloud_registered: !api_key.is_empty(),
                 },
                 _ => AuthState { valid: false, username: None, project_name: None,
-                                 expiry_date: None, allowed_meters: vec![] },
+                                 expiry_date: None, allowed_meters: vec![],
+                                 mode: None, tier: None, protocols: None,
+                                 cloud_registered: false },
             };
             ok(serde_json::to_value(auth).unwrap())
         }
@@ -1584,19 +1968,92 @@ async fn api_dispatch(
             }
             let expiry = (payload.created_at + payload.duration_days * 86_400) as i64;
             let m_json = serde_json::to_string(&payload.allowed_meters).map_err(api_e500)?;
-            let conn = s.db.lock().map_err(api_e500)?;
-            conn.execute("DELETE FROM settings", []).map_err(api_e500)?;
-            conn.execute(
-                "INSERT INTO settings (username, project_name, expiry_date, allowed_meters) VALUES (?1,?2,?3,?4)",
-                params![username.trim(), project_name.trim(), expiry, m_json],
-            ).map_err(api_e500)?;
+            {
+                let conn = s.db.lock().map_err(api_e500)?;
+                conn.execute("DELETE FROM settings", []).map_err(api_e500)?;
+                conn.execute(
+                    "INSERT INTO settings (username, project_name, expiry_date, allowed_meters, mode, tier, protocols, machine_api_key) VALUES (?1,?2,?3,?4,?5,?6,?7,'')",
+                    params![username.trim(), project_name.trim(), expiry, m_json,
+                            payload.mode, payload.tier as i64, payload.protocols],
+                ).map_err(api_e500)?;
+            } // ← DB lock released before any async work
+
+            // ── Cloud Handshake (online mode only, cloud build only) ──────────
+            #[cfg(feature = "cloud_sync")]
+            if payload.mode == "online" {
+                let machine_id = {
+                    let conn = s.db.lock().map_err(api_e500)?;
+                    get_or_create_machine_id(&conn)
+                };
+                let http = HttpClient::builder()
+                    .timeout(Duration::from_secs(15))
+                    .https_only(true)
+                    .build()
+                    .map_err(api_e500)?;
+                let resp = http
+                    .post(format!("{CLOUD_API_URL}/api/machine/activate"))
+                    .json(&serde_json::json!({
+                        "license_key":  key,
+                        "username":     username.trim(),
+                        "project_name": project_name.trim(),
+                        "machine_id":   machine_id,
+                        "tier":         payload.tier,
+                        "protocols":    payload.protocols,
+                    }))
+                    .send()
+                    .await
+                    .map_err(api_e500)?;
+                if resp.status().is_success() {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        if let Some(api_key) = json["machine_api_key"].as_str() {
+                            let conn = s.db.lock().map_err(api_e500)?;
+                            let _ = conn.execute(
+                                "UPDATE settings SET machine_api_key = ?1",
+                                params![api_key],
+                            );
+                            eprintln!("[license/rest] ✔ Cloud handshake complete");
+                        }
+                    }
+                } else {
+                    eprintln!("[license/rest] ✗ Cloud handshake HTTP {}", resp.status());
+                }
+            }
+
             ok(serde_json::to_value(format!(
-                "License activated for {} / {}. Valid {} days.",
-                username.trim(), project_name.trim(), payload.duration_days
+                "License activated for {} / {}. Valid {} days. Mode={} Tier={} Protocols={}.",
+                username.trim(), project_name.trim(), payload.duration_days,
+                payload.mode, payload.tier, payload.protocols
             )).unwrap())
         }
 
         "logout_user" => {
+            // ── Cloud key invalidation (fire-and-forget) ──────────────────────
+            #[cfg(feature = "cloud_sync")]
+            {
+                let result: Option<(String, String)> = s.db.lock().map_err(api_e500)?
+                    .query_row(
+                        "SELECT mode, machine_api_key FROM settings LIMIT 1",
+                        [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                    ).ok();
+                if let Some((mode, api_key)) = result {
+                    if mode == "online" && !api_key.is_empty() {
+                        tokio::spawn(async move {
+                            let client = HttpClient::builder()
+                                .timeout(Duration::from_secs(5))
+                                .https_only(true)
+                                .build()
+                                .unwrap_or_else(|_| HttpClient::new());
+                            let _ = client
+                                .post(format!("{CLOUD_API_URL}/api/machine/logout"))
+                                .bearer_auth(&api_key)
+                                .send()
+                                .await;
+                            eprintln!("[logout/rest] ✔ Cloud key invalidation sent");
+                        });
+                    }
+                }
+            }
+
             s.db.lock().map_err(api_e500)?
                 .execute("DELETE FROM settings", []).map_err(api_e500)?;
             ok(serde_json::Value::Null)
@@ -1660,6 +2117,8 @@ async fn api_dispatch(
                 }
             }
             s.engine.lock().map_err(api_e500)?.configured_devices = devices.clone();
+            let broadcast = build_state_msg(&s.engine);
+            ws_broadcast(&s.ws_clients, broadcast);
             ok(serde_json::to_value(devices).unwrap())
         }
 
@@ -1673,8 +2132,9 @@ async fn api_dispatch(
                 };
                 eng.poll.clone()
             };
-            // Emit to the desktop Tauri window so its UI stays in sync.
+            // Emit to the desktop Tauri window and broadcast to web clients.
             s.app.emit("status-changed", StatusEvent { state: new_state.clone() }).ok();
+            ws_broadcast(&s.ws_clients, build_state_msg(&s.engine));
             ok(serde_json::to_value(new_state).unwrap())
         }
 
@@ -1745,8 +2205,56 @@ async fn api_dispatch(
             ok(serde_json::Value::Null)
         }
 
+        // ── Mirror status (used by web clients on initial load) ───────────────
+        "status" => {
+            let eng = s.engine.lock().map_err(api_e500)?;
+            ok(serde_json::json!({
+                "configured_devices": eng.configured_devices,
+                "poll_state":         eng.poll,
+            }))
+        }
+
         other => Err((StatusCode::NOT_FOUND, format!("Unknown command: {other}"))),
     }
+}
+
+// ─── WebSocket Handler ────────────────────────────────────────────────────────
+
+/// Upgrade HTTP → WebSocket, then hand off to `handle_ws_client`.
+async fn ws_handler(
+    ws:           WebSocketUpgrade,
+    AxumState(s): AxumState<AxumAppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_ws_client(socket, s))
+}
+
+/// Maintain one connected web client.
+/// • Immediately pushes the current engine snapshot as the first frame.
+/// • Forwards every broadcast message from the mpsc channel to the socket.
+/// • Exits (and drops the sender) when the client disconnects.
+async fn handle_ws_client(mut socket: WebSocket, s: AxumAppState) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Register client; send initial snapshot.
+    if let Ok(mut list) = s.ws_clients.lock() {
+        list.push(tx);
+    }
+    let initial = build_state_msg(&s.engine);
+    let _ = socket.send(WsMessage::Text(initial)).await;
+
+    // Forward broadcasts → socket until either side closes.
+    loop {
+        tokio::select! {
+            Some(text) = rx.recv() => {
+                if socket.send(WsMessage::Text(text)).await.is_err() { break; }
+            }
+            msg = socket.recv() => {
+                // None = clean close; Some(Err(_)) = error — either way, exit.
+                if msg.map_or(true, |r| r.is_err()) { break; }
+            }
+        }
+    }
+    // Sender dropped here; ws_broadcast will prune it on the next send.
 }
 
 // ─── Intranet Web Server ──────────────────────────────────────────────────────
@@ -1814,8 +2322,10 @@ fn main() {
             app.manage(DbConnection(Arc::clone(&db)));
             app.manage(ProfilesState(Arc::clone(&profiles_map)));
             app.manage(SharedEngine(Arc::clone(&engine)));
-            let diag_flag = Arc::new(AtomicBool::new(false));
+            let diag_flag  = Arc::new(AtomicBool::new(false));
             app.manage(DiagEnabled(Arc::clone(&diag_flag)));
+            let ws_clients: WsClientList = Arc::new(Mutex::new(vec![]));
+            app.manage(WsClients(Arc::clone(&ws_clients)));
 
             // ── System Tray ──────────────────────────────────────────────────
             let show_i = MenuItem::with_id(app, "show", "Open Dashboard", true, None::<&str>)?;
@@ -1846,6 +2356,7 @@ fn main() {
                 Arc::clone(&profiles_map),
                 app.handle().clone(),
                 Arc::clone(&diag_flag),
+                Arc::clone(&ws_clients),
             ));
 
             // ── Nightly automation task ───────────────────────────────────────
@@ -1854,19 +2365,32 @@ fn main() {
                 Arc::clone(&db_path_arc),
             ));
 
+            // ── Store & Forward sync loop (cloud builds only) ─────────────────
+            #[cfg(feature = "cloud_sync")]
+            tauri::async_runtime::spawn(run_cloud_sync_loop(
+                Arc::clone(&db),
+                HttpClient::builder()
+                    .timeout(Duration::from_secs(10))
+                    .https_only(true)
+                    .build()
+                    .expect("reqwest client build failed"),
+            ));
+
             // ── Intranet Web Server (Axum) ────────────────────────────────────
             // Serves the compiled React SPA on port 3030 for phone/tablet access.
             // REST endpoints under /api/:cmd mirror every Tauri command.
             let axum_state = AxumAppState {
-                db:       Arc::clone(&db),
-                profiles: Arc::clone(&profiles_map),
-                engine:   Arc::clone(&engine),
-                app:      app.handle().clone(),
-                diag:     Arc::clone(&diag_flag),
+                db:         Arc::clone(&db),
+                profiles:   Arc::clone(&profiles_map),
+                engine:     Arc::clone(&engine),
+                app:        app.handle().clone(),
+                diag:       Arc::clone(&diag_flag),
+                ws_clients: Arc::clone(&ws_clients),
             };
             tauri::async_runtime::spawn(async move {
                 let web_app = Router::new()
                     .route("/api/:cmd", post(api_dispatch))
+                    .route("/ws",       get(ws_handler))
                     .fallback(web_handler)
                     .with_state(axum_state);
                 let listener = tokio::net::TcpListener::bind("0.0.0.0:3030")
@@ -1879,6 +2403,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_build_info,
             toggle_polling, get_status, clear_history, get_record_count, export_to_excel,
             activate_license, get_auth_state, logout_user,
             get_meter_profiles, reload_profiles, apply_bus_config,

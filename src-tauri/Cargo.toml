@@ -3,6 +3,13 @@ name    = "powermeter-demo"
 version = "0.1.0"
 edition = "2021"
 
+# ── Feature Flags ───────────────────────────────────────────────────────────────
+# default = [] means the default (offline/air-gapped) build compiles zero cloud code.
+# To produce an online/cloud build: cargo tauri build --features cloud_sync
+[features]
+default    = []
+cloud_sync = ["dep:lettre", "dep:reqwest"]
+
 [lib]
 name       = "powermeter_demo_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -25,10 +32,11 @@ tokio-modbus        = { version = "0.7", default-features = false, features = ["
 # ── Licensing ──────────────────────────────────────────────────────────────────
 aes-gcm             = "0.10"
 base64              = "0.21"
-lettre = { version = "0.11", features = ["smtp-transport", "native-tls", "builder", "tokio1", "tokio1-native-tls"] }
+lettre  = { version = "0.11", features = ["smtp-transport", "native-tls", "builder", "tokio1", "tokio1-native-tls"], optional = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 
 # ── Intranet Web Server ─────────────────────────────────────────────────────────
-axum                = { version = "0.7", features = ["macros"] }
+axum                = { version = "0.7", features = ["macros", "ws"] }
 tower-http          = { version = "0.5", features = ["cors", "fs"] }
 rust-embed          = { version = "8", features = ["mime-guess"] }
 mime_guess          = "2"

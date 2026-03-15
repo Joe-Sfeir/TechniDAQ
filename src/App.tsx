@@ -39,8 +39,13 @@ interface StatusEvent { state: PollState }
 interface AuthState {
   valid: boolean; username?: string; project_name?: string;
   expiry_date?: number; allowed_meters: string[];
+  mode?:              "offline" | "online";
+  tier?:              1 | 2 | 3;
+  protocols?:         "RTU" | "TCP" | "All";
+  cloud_registered?:  boolean;
 }
-interface DiagEvent { direction: string; hex: string; device_name: string; timestamp_ms: number; }
+interface DiagEvent   { direction: string; hex: string; device_name: string; timestamp_ms: number; }
+interface BuildInfo   { is_cloud_build: boolean; }
 
 type PollState    = "running" | "stopped" | "fault";
 type Theme        = "dark"   | "light";
@@ -793,6 +798,7 @@ function AppHeader({
   onClear, onExport, exportStatus,
   username, projectName, onLogout, configuredDevices, activeDeviceName,
   isSimulation, onOpenTerminal, hasDiagnostics,
+  licenseMode, licenseTier, isCloudBuild, cloudRegistered,
 }:{
   pollState:PollState; lastPollMs:number; theme:Theme;
   onThemeToggle:()=>void; onTogglePoll:()=>void;
@@ -800,6 +806,8 @@ function AppHeader({
   username:string; projectName:string; onLogout:()=>void;
   configuredDevices:DeviceConfig[]; activeDeviceName:string|undefined;
   isSimulation:boolean; onOpenTerminal: ()=>void; hasDiagnostics: boolean;
+  licenseMode?: "offline" | "online"; licenseTier?: 1 | 2 | 3;
+  isCloudBuild: boolean; cloudRegistered?: boolean;
 }) {
   const isDark    = theme === "dark";
   const isRunning = pollState === "running";
@@ -846,6 +854,44 @@ function AppHeader({
           </div>
         </div>
       </div>
+
+      {/* Edition / license badge — hard-branched on build type */}
+      {!isCloudBuild ? (
+        // Air-gapped binary: static label baked at compile time, never dynamic
+        <div style={{
+          flexShrink:0, display:"flex", alignItems:"center",
+          padding:"3px 9px", borderRadius:"4px",
+          border:`1px solid ${CLR.amber}60`,
+          background:`${CLR.amber}18`,
+          fontFamily:"'Share Tech Mono',monospace", fontSize:"0.48rem",
+          letterSpacing:"0.14em", textTransform:"uppercase",
+          color:CLR.amber, whiteSpace:"nowrap",
+        }}>
+          AIR-GAPPED EDITION
+        </div>
+      ) : licenseMode ? (
+        // Cloud binary: dynamic mode/tier badge from decrypted license payload
+        <div style={{
+          flexShrink:0, display:"flex", alignItems:"center",
+          padding:"3px 9px", borderRadius:"4px",
+          border:`1px solid ${licenseMode==="online" && (licenseTier??1)>=2 ? CLR.blue+"60" : CLR.amber+"60"}`,
+          background:licenseMode==="online" && (licenseTier??1)>=2 ? CLR.blue+"18" : CLR.amber+"18",
+          fontFamily:"'Share Tech Mono',monospace", fontSize:"0.48rem",
+          letterSpacing:"0.14em", textTransform:"uppercase",
+          color:licenseMode==="online" && (licenseTier??1)>=2 ? CLR.blue : CLR.amber,
+          gap:"5px", whiteSpace:"nowrap",
+        }}>
+          <span>{licenseMode==="offline" ? "AIR-GAPPED" : "ONLINE"}</span>
+          <span style={{ opacity:0.5 }}>·</span>
+          <span>TIER {licenseTier??1}</span>
+          {licenseMode === "online" && cloudRegistered && (
+            <>
+              <span style={{ opacity:0.5 }}>·</span>
+              <span style={{ color: CLR.green }}>&#9679; SYNCED</span>
+            </>
+          )}
+        </div>
+      ) : null}
 
       {/* Device summary */}
       <div style={{ flex:1,minWidth:0 }}>
@@ -1063,9 +1109,10 @@ interface CustomRegDraft {
 }
 const EMPTY_DRAFT:CustomRegDraft = {name:"",address:"",length:"2",data_type:"Float32",multiplier:"1.0"};
 
-function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove }:{
+function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove,licensedProtocols }:{
   device:DeviceConfig; index:number; profiles:MeterProfile[]; isDark:boolean;
   onUpdate:(d:DeviceConfig)=>void; onRemove:()=>void;
+  licensedProtocols?: "RTU" | "TCP" | "All";
 }) {
   const [expanded,  setExpanded]  = useState(index===0);
   const [search,    setSearch]    = useState("");
@@ -1231,9 +1278,20 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove }:{
               <label style={lS}>Protocol</label>
               <select value={device.protocol} style={{...iS,cursor:"pointer",width:"auto",paddingRight:"24px"}}
                 onChange={e=>onUpdate({...device,protocol:e.target.value as "rtu"|"tcp"})}>
-                <option value="rtu">Modbus RTU</option>
-                <option value="tcp">Modbus TCP</option>
+                {(!licensedProtocols || licensedProtocols === "All" || licensedProtocols === "RTU") && (
+                  <option value="rtu">Modbus RTU</option>
+                )}
+                {(!licensedProtocols || licensedProtocols === "All" || licensedProtocols === "TCP") && (
+                  <option value="tcp">Modbus TCP</option>
+                )}
               </select>
+              {licensedProtocols && licensedProtocols !== "All" && (
+                <div style={{ marginTop:"3px", fontFamily:"'Share Tech Mono',monospace",
+                  fontSize:"0.48rem", letterSpacing:"0.08em",
+                  color: CLR.amber }}>
+                  License: {licensedProtocols} only
+                </div>
+              )}
             </div>
             {device.protocol==="rtu" ? <>
               <div>
@@ -1443,9 +1501,12 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove }:{
 
 // ─── DeviceSetupModal ────────────────────────────────────────────────────────
 
-function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme }:{
+function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme,licensedProtocols,isCloudEnabled,isCloudBuild }:{
   profiles:MeterProfile[]; initialDevices:DeviceConfig[];
   onSave:(devices:DeviceConfig[])=>void; onClose:()=>void; theme:Theme;
+  licensedProtocols?: "RTU" | "TCP" | "All";
+  isCloudEnabled?: boolean;
+  isCloudBuild: boolean;
 }) {
   const isDark = theme==="dark";
   const [devices,setDevices] = useState<DeviceConfig[]>(()=>
@@ -1524,7 +1585,8 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme }:{
         <div style={{ flex:1,overflowY:"auto",padding:"14px 20px" }}>
           {devices.map((dev,i)=>(
             <DevicePanel key={i} index={i} device={dev} profiles={profiles} isDark={isDark}
-              onUpdate={d=>updDevice(i,d)} onRemove={()=>remDevice(i)}/>
+              onUpdate={d=>updDevice(i,d)} onRemove={()=>remDevice(i)}
+              licensedProtocols={licensedProtocols}/>
           ))}
           <button onClick={addDevice} style={{
             width:"100%",padding:"10px",
@@ -1629,6 +1691,45 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme }:{
               </div>
             </div>
           </div>
+
+          {/* Cloud Sync — absent from air-gapped binary, no DOM nodes, no greyed card */}
+          {isCloudBuild && (
+            <div style={{ marginTop:"12px", ...glass(isDark), overflow:"hidden",
+              opacity: isCloudEnabled ? 1 : 0.45,
+              pointerEvents: isCloudEnabled ? "auto" : "none",
+            }}>
+              <div style={{ padding:"8px 14px", borderBottom:`1px solid ${border}`,
+                background:isDark?"rgba(255,255,255,0.02)":"rgba(0,0,0,0.02)",
+                display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.5rem",
+                  letterSpacing:"0.18em", textTransform:"uppercase", color:CLR.text3(isDark) }}>
+                  Cloud Sync &amp; Telemetry
+                </span>
+                {!isCloudEnabled && (
+                  <span style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.46rem",
+                    letterSpacing:"0.1em", color:CLR.amber,
+                    border:`1px solid ${CLR.amber}50`, borderRadius:"3px", padding:"1px 6px" }}>
+                    Requires Online · Tier 2+
+                  </span>
+                )}
+              </div>
+              <div style={{ padding:"12px 14px", display:"flex", flexDirection:"column", gap:"6px" }}>
+                <div style={{ fontSize:"0.68rem", color:CLR.text2(isDark) }}>
+                  Push live readings and alarms to the TechniDAQ cloud dashboard.
+                  Available for <strong>Online</strong> licenses at <strong>Tier 2</strong> or higher.
+                </div>
+                <button disabled={!isCloudEnabled} style={{
+                  alignSelf:"flex-start", height:"30px", padding:"0 16px", borderRadius:"5px",
+                  background: isCloudEnabled ? CLR.blue+"20" : "transparent",
+                  border:`1px solid ${isCloudEnabled ? CLR.blue+"50" : CLR.border(isDark)}`,
+                  color: isCloudEnabled ? CLR.blue : CLR.text3(isDark),
+                  cursor: isCloudEnabled ? "pointer" : "not-allowed",
+                  fontFamily:"'Rajdhani',sans-serif", fontWeight:700,
+                  fontSize:"0.7rem", letterSpacing:"0.08em",
+                }}>Connect to Cloud</button>
+              </div>
+            </div>
+          )}
         </div>
 
         <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",
@@ -2031,6 +2132,8 @@ export default function App() {
   );
   const [showTerminal,      setShowTerminal]       = useState(false);
   const [diagLines,         setDiagLines]          = useState<DiagLine[]>([]);
+  // Default false — safe offline assumption until backend confirms cloud build.
+  const [isCloudBuild,      setIsCloudBuild]       = useState(false);
 
   const toastRef  = useRef<ReturnType<typeof setTimeout>|null>(null);
   const exportRef = useRef<ReturnType<typeof setTimeout>|null>(null);
@@ -2048,8 +2151,11 @@ export default function App() {
     toastRef.current=setTimeout(()=>setToast(t=>({...t,visible:false})),4000);
   },[]);
 
-  // ── Auth ──────────────────────────────────────────────────────────────────
+  // ── Build type + Auth (parallel on startup) ───────────────────────────────
   useEffect(()=>{
+    invokeApi<BuildInfo>("get_build_info")
+      .then(b => setIsCloudBuild(b.is_cloud_build))
+      .catch(() => setIsCloudBuild(false)); // fail-safe: treat unknown as air-gapped
     invokeApi<AuthState>("get_auth_state")
       .then(a=>{setAuthState(a);setCheckingAuth(false);})
       .catch(()=>{setAuthState({valid:false,allowed_meters:[]});setCheckingAuth(false);});
@@ -2064,6 +2170,72 @@ export default function App() {
         .catch(e=>showToast(`Failed to load profiles: ${e}`,"error"));
     }
   },[authState?.valid]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Web-client mirror sync ────────────────────────────────────────────────
+  // When running in a browser (phone/tablet), pull a snapshot of the current
+  // desktop state and then keep it live via WebSocket.
+  useEffect(()=>{
+    if(isTauri || !authState?.valid) return;
+
+    const base = `http://${window.location.hostname}:3030`;
+
+    // Initial snapshot: configured devices + poll state.
+    fetch(`${base}/api/status`, { method:"POST", headers:{"Content-Type":"application/json"}, body:"{}" })
+      .then(r=>r.json())
+      .then((data:{configured_devices:DeviceConfig[];poll_state:PollState})=>{
+        if(data.configured_devices?.length){
+          setConfiguredDevices(data.configured_devices);
+          setActiveTab(data.configured_devices[0].device_name);
+        }
+        if(data.poll_state) setPollState(data.poll_state);
+      })
+      .catch(e=>console.warn("[mirror] status fetch failed:", e));
+
+    // WebSocket: receive STATE_CHANGE broadcasts from the host machine.
+    const ws = new WebSocket(`ws://${window.location.hostname}:3030/ws`);
+    ws.onopen    = ()  => console.log("[mirror] WebSocket connected");
+    ws.onmessage = (ev)=> {
+      try {
+        const msg = JSON.parse(ev.data) as {
+          type: string;
+          configured_devices?: DeviceConfig[];
+          poll_state?: PollState;
+          device_name?: string;
+          device_id?: string;
+          timestamp_ms?: number;
+          data?: Record<string, number>;
+        };
+        if(msg.type === "STATE_CHANGE"){
+          if(msg.configured_devices){
+            setConfiguredDevices(msg.configured_devices);
+            if(msg.configured_devices.length) setActiveTab(t=>t||msg.configured_devices![0].device_name);
+          }
+          if(msg.poll_state) setPollState(msg.poll_state);
+        } else if(msg.type === "METER_DATA" && msg.device_name && msg.data){
+          const r: MeterReading = {
+            device_name: msg.device_name,
+            device_id: msg.device_id ?? "",
+            timestamp_ms: msg.timestamp_ms ?? Date.now(),
+            data: msg.data,
+          };
+          setLastPollMs(r.timestamp_ms);
+          setLatestByDevice(prev=>({...prev,[r.device_name]:r}));
+          const time=new Date(r.timestamp_ms).toLocaleTimeString("en-GB",{hour12:false});
+          setHistoryByDevice(prev=>{
+            const old=prev[r.device_name]??[];
+            const next=[...old];
+            if(next.length>0&&next[next.length-1].time===time)
+              next[next.length-1]={...next[next.length-1],...r.data};
+            else next.push({time,...r.data});
+            return {...prev,[r.device_name]:next.length>MAX_HISTORY?next.slice(-MAX_HISTORY):next};
+          });
+        }
+      } catch { /* ignore malformed frames */ }
+    };
+    ws.onerror = (e)=> console.warn("[mirror] WebSocket error:", e);
+
+    return ()=>{ ws.close(); };
+  },[isTauri, authState?.valid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Events ────────────────────────────────────────────────────────────────
   useEffect(()=>{
@@ -2203,6 +2375,10 @@ export default function App() {
   // ── Diagnostics flag ──────────────────────────────────────────────────────
   const hasDiagnostics = authState?.allowed_meters.includes("Diagnostics") ?? false;
 
+  // ── Cloud / advanced telemetry flag ───────────────────────────────────────
+  // Requires online mode AND tier 2 or higher.
+  const isCloudEnabled = authState?.mode === "online" && (authState?.tier ?? 1) >= 2;
+
   // ── Enable/disable diagnostics when terminal is toggled ───────────────────
   useEffect(()=>{
     if (!authState?.valid) return;
@@ -2246,6 +2422,9 @@ export default function App() {
           onSave={handleSaveBusConfig}
           onClose={()=>setShowModal(false)}
           theme={theme}
+          licensedProtocols={authState?.protocols}
+          isCloudEnabled={isCloudEnabled}
+          isCloudBuild={isCloudBuild}
         />
       )}
 
@@ -2273,6 +2452,10 @@ export default function App() {
         isSimulation={isSimulation}
         onOpenTerminal={()=>setShowTerminal(t=>!t)}
         hasDiagnostics={hasDiagnostics}
+        licenseMode={authState?.mode}
+        licenseTier={authState?.tier}
+        isCloudBuild={isCloudBuild}
+        cloudRegistered={authState?.cloud_registered}
       />
 
       <BusBar
