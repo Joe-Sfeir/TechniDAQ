@@ -43,7 +43,7 @@ use tokio_serial::SerialStream;
 
 const MASTER_KEY_HEX:       &str = "6f3d9a2e1b8c4f7a0e5d2b9c6a3f1e8d4b7c0a9e2f5d8b1c4a7e0f3d6b9c2a5f";
 #[cfg(feature = "cloud_sync")]
-const CLOUD_API_URL: &str = "https://api.technicat.cloud";
+const CLOUD_API_URL: &str = "https://technicloudapi.onrender.com";
 #[cfg(feature = "cloud_sync")]
 const SMTP_HOST: &str = "smtp.gmail.com";
 #[cfg(feature = "cloud_sync")]
@@ -291,6 +291,23 @@ fn custom_profile() -> MeterProfileEntry {
     }
 }
 
+/// Returns the "Simulation" device — injected when license permits "Simulation" or "All".
+fn simulation_profile() -> MeterProfileEntry {
+    MeterProfileEntry {
+        model:        "Simulation".into(),
+        display_name: "Simulation".into(),
+        endianness:   "ABCD".into(),
+        baud_rate:    9600,
+        parity:       "None".into(),
+        registers:    vec![],
+    }
+}
+
+/// Normalise a meter name for fuzzy matching: lowercase, spaces/hyphens → underscores.
+fn normalize_meter_name(s: &str) -> String {
+    s.to_lowercase().replace([' ', '-'], "_")
+}
+
 // ─── Byte-Order / Decode Helpers ──────────────────────────────────────────────
 
 fn regs_to_f32(regs: &[u16], endian: &str) -> f32 {
@@ -355,8 +372,15 @@ fn decrypt_license_token(token: &str) -> Result<LicensePayload, String> {
     let key        = Key::<Aes256Gcm>::from_slice(&key_bytes);
     let plaintext  = Aes256Gcm::new(key)
         .decrypt(Nonce::from_slice(iv_b), ct)
-        .map_err(|_| "Invalid or tampered license key".to_string())?;
-    serde_json::from_slice(&plaintext).map_err(|e| format!("Payload corrupt: {e}"))
+        .map_err(|e| {
+            eprintln!("[license] AES-GCM decryption error: {:?}", e);
+            "Invalid or tampered license key".to_string()
+        })?;
+    let payload_str = String::from_utf8_lossy(&plaintext);
+    serde_json::from_slice(&plaintext).map_err(|e| {
+        eprintln!("[license] Deserialization failed. Payload: {}, Error: {:?}", payload_str, e);
+        format!("Payload corrupt: {e}")
+    })
 }
 
 /// Read or generate a stable machine identifier, stored in `app_config`.
@@ -404,18 +428,19 @@ fn get_license_protocols_from_db(db: &Arc<Mutex<Connection>>) -> String {
 fn sim_register_value(name: &str, idx: usize) -> f64 {
     let t = now_ms() as f64 / 1000.0;
     let n = name.to_lowercase();
-    let (base, amp, freq) = if n.contains("voltage") {
-        (228.0_f64, 5.0, 0.10)
-    } else if n.contains("current") {
-        (28.0,  8.0,   0.17)
-    } else if n.contains("power") && !n.contains("factor") {
-        (6_000.0, 1_500.0, 0.07)
-    } else if n.contains("frequen") {
-        (49.97, 0.05, 0.013)
+    // (base, amplitude, frequency_hz) — output = base + amp * sin(...)
+    let (base, amp, freq) = if n.contains("volt") {
+        (227.5_f64, 7.5,  0.10)   // 220–235 V
+    } else if n.contains("curr") || n.contains("amp") {
+        (30.0,      20.0, 0.17)   // 10–50 A
     } else if n.contains("factor") {
-        (0.94,  0.04, 0.09)
+        (0.94,      0.04, 0.09)   // 0.90–0.98
+    } else if n.contains("pow") || n.contains("kw") {
+        (10.0,      5.0,  0.07)   // 5–15 kW
+    } else if n.contains("freq") || n.contains("hz") {
+        (50.0,      0.1,  0.013)  // 49.9–50.1 Hz
     } else {
-        (50.0,  25.0, 0.11)
+        (50.5,      49.5, 0.11)   // 1–100 (generic)
     };
     let phase = idx as f64 * 0.7;
     base + amp * (t * freq * std::f64::consts::TAU + phase).sin()
@@ -1029,23 +1054,45 @@ fn get_meter_profiles(
 ) -> Result<Vec<MeterProfileEntry>, String> {
     let lib = profiles_state.0.lock().map_err(|e| e.to_string())?;
 
-    let mut result: Vec<MeterProfileEntry> = if allowed_meters.contains(&"All".to_string()) {
+    let norm_allowed: Vec<String> = allowed_meters.iter().map(|m| normalize_meter_name(m)).collect();
+    let allow_all = norm_allowed.contains(&"all".to_string());
+
+    let mut result: Vec<MeterProfileEntry> = if allow_all {
         // License grants everything — return all profiles in the library
         let mut v: Vec<MeterProfileEntry> = lib.values().cloned().collect();
         v.sort_by(|a, b| a.display_name.cmp(&b.display_name));
         v
     } else {
-        allowed_meters.iter()
-            .filter(|m| m.as_str() != "Custom" && m.as_str() != "Simulation")
-            .filter_map(|m| lib.get(m).cloned())
+        norm_allowed.iter()
+            .filter(|m| m.as_str() != "custom" && m.as_str() != "simulation")
+            .filter_map(|norm| {
+                lib.values().find(|p| normalize_meter_name(&p.model) == *norm).cloned()
+            })
             .collect()
     };
 
-    // "Custom" is available only when the license explicitly permits it ("Custom" or "All")
-    let license_allows_custom = allowed_meters.contains(&"All".to_string())
-        || allowed_meters.contains(&"Custom".to_string());
+    // Inject "Custom" when license permits it ("Custom" or "All")
+    let license_allows_custom = allow_all || norm_allowed.contains(&"custom".to_string());
     if license_allows_custom && !result.iter().any(|p| p.model == "Custom") {
         result.push(custom_profile());
+    }
+
+    // Inject "Simulation" when license permits it ("Simulation" or "All")
+    // Clone PM2220 registers so the demo shows real variables; fall back to blank if not found.
+    let license_allows_sim = allow_all || norm_allowed.contains(&"simulation".to_string());
+    if license_allows_sim && !result.iter().any(|p| p.model == "Simulation") {
+        let sim = lib.values()
+            .find(|p| normalize_meter_name(&p.model) == "schneider_pm2220")
+            .map(|pm| MeterProfileEntry {
+                model:        "Simulation".into(),
+                display_name: "Simulation".into(),
+                endianness:   pm.endianness.clone(),
+                baud_rate:    pm.baud_rate,
+                parity:       pm.parity.clone(),
+                registers:    pm.registers.clone(),
+            })
+            .unwrap_or_else(simulation_profile);
+        result.push(sim);
     }
 
     Ok(result)
@@ -1087,8 +1134,13 @@ fn apply_bus_config(
         if dev.selected_registers.is_empty() {
             return Err(format!("\"{}\" — At least one register must be selected.", dev.device_name));
         }
-        if dev.meter_model != "Custom" && !lib.contains_key(&dev.meter_model) {
-            return Err(format!("\"{}\" — Unknown model \"{}\".", dev.device_name, dev.meter_model));
+        {
+            let norm = normalize_meter_name(&dev.meter_model);
+            let is_virtual = norm == "custom" || norm == "custom_device" || norm == "simulation";
+            let in_lib = lib.values().any(|p| normalize_meter_name(&p.model) == norm);
+            if !is_virtual && !in_lib {
+                return Err(format!("\"{}\" — Unknown model \"{}\".", dev.device_name, dev.meter_model));
+            }
         }
     }
 
@@ -1437,6 +1489,39 @@ async fn run_polling_loop(
                 .unwrap_or(u128::MAX);
             if elapsed < device.poll_rate_ms as u128 { continue; }
 
+            // ── Per-device simulation bypass ──────────────────────────────────
+            if normalize_meter_name(&device.meter_model) == "simulation" {
+                let data: HashMap<String, f64> = device.selected_registers.iter().enumerate()
+                    .map(|(i, reg)| (reg.name.clone(), sim_register_value(&reg.name, i)))
+                    .collect();
+                let device_id = format!("Simulation #{:02}", device.slave_id);
+                let data_json = serde_json::to_string(&data).unwrap_or_default();
+                {
+                    let conn = db.lock().unwrap();
+                    if let Err(e) = conn.execute(
+                        "INSERT INTO meter_history (timestamp, device_name, device_id, data) VALUES (?1,?2,?3,?4)",
+                        params![wall_clock_iso(), &device.device_name, &device_id, &data_json],
+                    ) { eprintln!("[sim] INSERT: {e}"); }
+                }
+                let ts = now_ms();
+                let ws_frame = serde_json::json!({
+                    "type": "METER_DATA",
+                    "device_name": &device.device_name,
+                    "device_id": &device_id,
+                    "timestamp_ms": ts,
+                    "data": &data,
+                }).to_string();
+                let _ = app.emit("meter-data", MeterReading {
+                    device_name: device.device_name.clone(),
+                    device_id,
+                    timestamp_ms: ts,
+                    data,
+                });
+                ws_broadcast(&ws_clients, ws_frame);
+                last_polled.insert(device.device_name.clone(), Instant::now());
+                continue;
+            }
+
             let conn_key = ConnKey::from_device(device);
 
             // Per-connection fault cooldown
@@ -1767,29 +1852,30 @@ async fn run_cloud_sync_loop(db: Arc<Mutex<Connection>>, client: HttpClient) {
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
             )))
-            .unwrap_or_else(|_| Box::new(std::iter::empty()))
-            .filter_map(|r| r.ok())
-            .collect()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
         };
 
         if rows.is_empty() { continue; }
 
         let ids: Vec<i64>              = rows.iter().map(|(id, ..)| *id).collect();
-        let readings: Vec<serde_json::Value> = rows.iter().map(|(id, ts, dn, di, data)| {
+        let readings: Vec<serde_json::Value> = rows.iter().map(|(_id, ts, dn, _di, data)| {
+            // Parse the stored JSON string back into a Value so the API receives
+            // "data": {...} (object), not "data": "{...}" (string).
+            let data_obj: serde_json::Value = serde_json::from_str(data)
+                .unwrap_or(serde_json::Value::Object(Default::default()));
             serde_json::json!({
-                "id":          id,
                 "timestamp":   ts,
                 "device_name": dn,
-                "device_id":   di,
-                "data":        data,
+                "data":        data_obj,
             })
         }).collect();
 
         // ── POST batch to cloud ────────────────────────────────────────────
         let result = client
             .post(format!("{CLOUD_API_URL}/api/machine/ingest"))
-            .bearer_auth(&api_key)
-            .json(&serde_json::json!({ "readings": readings }))
+            .header("x-api-key", &api_key)
+            .json(&serde_json::json!({ "telemetry_array": readings }))
             .send()
             .await;
 
@@ -2066,20 +2152,38 @@ async fn api_dispatch(
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
             let lib = s.profiles.lock().map_err(api_e500)?;
-            let mut result: Vec<MeterProfileEntry> = if allowed.contains(&"All".to_string()) {
+            let norm_allowed: Vec<String> = allowed.iter().map(|m| normalize_meter_name(m)).collect();
+            let allow_all = norm_allowed.contains(&"all".to_string());
+            let mut result: Vec<MeterProfileEntry> = if allow_all {
                 let mut v: Vec<MeterProfileEntry> = lib.values().cloned().collect();
                 v.sort_by(|a, b| a.display_name.cmp(&b.display_name));
                 v
             } else {
-                allowed.iter()
-                    .filter(|m| m.as_str() != "Custom" && m.as_str() != "Simulation")
-                    .filter_map(|m| lib.get(m.as_str()).cloned())
+                norm_allowed.iter()
+                    .filter(|m| m.as_str() != "custom" && m.as_str() != "simulation")
+                    .filter_map(|norm| {
+                        lib.values().find(|p| normalize_meter_name(&p.model) == *norm).cloned()
+                    })
                     .collect()
             };
-            let allow_custom = allowed.contains(&"All".to_string())
-                || allowed.contains(&"Custom".to_string());
+            let allow_custom = allow_all || norm_allowed.contains(&"custom".to_string());
             if allow_custom && !result.iter().any(|p| p.model == "Custom") {
                 result.push(custom_profile());
+            }
+            let allow_sim = allow_all || norm_allowed.contains(&"simulation".to_string());
+            if allow_sim && !result.iter().any(|p| p.model == "Simulation") {
+                let sim = lib.values()
+                    .find(|p| normalize_meter_name(&p.model) == "schneider_pm2220")
+                    .map(|pm| MeterProfileEntry {
+                        model:        "Simulation".into(),
+                        display_name: "Simulation".into(),
+                        endianness:   pm.endianness.clone(),
+                        baud_rate:    pm.baud_rate,
+                        parity:       pm.parity.clone(),
+                        registers:    pm.registers.clone(),
+                    })
+                    .unwrap_or_else(simulation_profile);
+                result.push(sim);
             }
             ok(serde_json::to_value(result).unwrap())
         }
@@ -2110,9 +2214,14 @@ async fn api_dispatch(
                         return Err(api_e400(format!(
                             "\"{}\" — At least one register must be selected.", dev.device_name)));
                     }
-                    if dev.meter_model != "Custom" && !lib.contains_key(&dev.meter_model) {
-                        return Err(api_e400(format!(
-                            "\"{}\" — Unknown model \"{}\".", dev.device_name, dev.meter_model)));
+                    {
+                        let norm = normalize_meter_name(&dev.meter_model);
+                        let is_virtual = norm == "custom" || norm == "custom_device" || norm == "simulation";
+                        let in_lib = lib.values().any(|p| normalize_meter_name(&p.model) == norm);
+                        if !is_virtual && !in_lib {
+                            return Err(api_e400(format!(
+                                "\"{}\" — Unknown model \"{}\".", dev.device_name, dev.meter_model)));
+                        }
                     }
                 }
             }

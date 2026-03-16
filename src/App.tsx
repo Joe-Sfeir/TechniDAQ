@@ -2415,7 +2415,7 @@ export default function App() {
     }}>
       <Toast {...toast}/>
 
-      {showModal && profiles.length > 0 && (
+      {showModal && (
         <DeviceSetupModal
           profiles={profiles}
           initialDevices={configuredDevices}
