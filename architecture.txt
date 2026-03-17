@@ -1,0 +1,487 @@
+================================================================================
+TECHNIDAQ POWERMETER DEMO — ARCHITECTURE SNAPSHOT
+Generated: 2026-03-17
+================================================================================
+
+DIRECTORY TREE
+--------------
+powermeter-demo/
+├── .claude/
+│   └── settings.local.json
+├── .vscode/
+│   └── extensions.json
+├── CLAUDE.md
+├── generate_license.cjs
+├── index.html
+├── package.json
+├── package-lock.json
+├── postcss.config.js
+├── public/
+│   ├── icon.png
+│   ├── tauri.svg
+│   └── vite.svg
+├── README.md
+├── src/
+│   ├── api.ts
+│   ├── App.css
+│   ├── App.tsx
+│   ├── assets/
+│   │   ├── logo.png
+│   │   ├── logo_square.png
+│   │   ├── logo1.png
+│   │   ├── logo2.png
+│   │   └── react.svg
+│   ├── main.tsx
+│   └── vite-env.d.ts
+├── src-tauri/
+│   ├── build.rs
+│   ├── capabilities/
+│   │   └── default.json
+│   ├── Cargo.lock
+│   ├── Cargo.toml
+│   ├── gen/schemas/
+│   │   ├── acl-manifests.json
+│   │   ├── capabilities.json
+│   │   ├── desktop-schema.json
+│   │   └── windows-schema.json
+│   ├── icons/  (32x32, 128x128, 128x128@2x, icon.icns, icon.ico, Square*Logo.png, StoreLogo.png,
+│   │            ios/AppIcon-*.png, android/mipmap-*/ic_launcher*.png)
+│   ├── profiles.json
+│   ├── src/
+│   │   ├── lib.rs
+│   │   └── main.rs
+│   └── tauri.conf.json
+├── tailwind.config.js
+├── tsconfig.json
+├── tsconfig.node.json
+└── vite.config.ts
+
+================================================================================
+FILE SUMMARIES
+================================================================================
+
+--- src/main.tsx ---
+Entry point. Mounts <App /> inside React.StrictMode via ReactDOM.createRoot.
+Imports (local): ./App
+
+--- src/api.ts ---
+Exports:
+  isTauri: boolean          — runtime detection of Tauri webview vs. browser
+  invokeApi<T>(cmd, args)   — IPC bridge: uses Tauri invoke() in app, falls
+                               back to POST /api/<cmd> in browser web mode
+  listenApi<T>(event, handler) — event bridge: Tauri listen() in app,
+                                  no-op stub in web mode
+  type UnlistenFn           — re-exported from @tauri-apps/api/event
+  type EventCallback        — re-exported from @tauri-apps/api/event
+
+Imports (local): none (uses dynamic import() for all @tauri-apps/* at runtime)
+Notes:
+  - All @tauri-apps/* imports are DYNAMIC to avoid crashing plain browser loads.
+  - Web fallback POSTs to relative URL /api/<cmd> (same-origin, intranet).
+
+--- src/App.tsx ---
+Exports: default function App  (single default export)
+Imports (local): ./api  (invokeApi, listenApi, isTauri, UnlistenFn), ./assets/logo.png, ./App.css
+
+Sub-components (defined in same file, not exported):
+  regPalette(name, idx)        — maps register name → color palette entry
+  MetricCard                   — live register value card with sparkline + alarm animation
+  DeviceTabBar                 — per-device tab strip with live-indicator dots
+  WaveformChart                — Recharts line chart for historical readings
+  ExportDropdown               — export-to-Excel dropdown with time-range options
+  Toast                        — transient notification overlay
+  ComPortSelector              — COM port dropdown (COM1–COM12)
+  AppHeader                    — top navigation bar (logo, status pill, theme toggle, tray)
+  BusBar                       — configured device summary bar with polling controls
+  DevicePanel                  — individual device slot editor inside setup modal
+  DeviceSetupModal             — full-screen configuration wizard (multi-device slots)
+  LicenseGateway               — license activation form (key + username + project)
+  LogoutModal                  — logout confirmation dialog
+  AuthLoadingScreen            — splash shown while auth state is loading
+  DiagTerminal                 — scrollable hex frame diagnostic console
+
+Key state in App:
+  activeTab          — currently selected device tab name
+  readings           — Map<device_name, MeterReading>   (latest per device)
+  history            — Map<device_name, MeterReading[]>  (rolling 60-point buffer)
+  authState          — AuthState (gates all controls until licensed)
+  pollState          — "running" | "stopped" | "fault"
+  configuredDevices  — DeviceConfig[]
+  theme              — "dark" | "light" (persisted to localStorage)
+
+Tauri invokes (via invokeApi):
+  get_build_info()                                    → BuildInfo
+  get_auth_state()                                    → AuthState
+  get_status()                                        → PollState
+  get_meter_profiles({ allowedMeters })               → MeterProfile[]
+  apply_bus_config({ devices })                       → DeviceConfig[]
+  toggle_polling({})                                  → PollState
+  clear_history()                                     → number (rows deleted)
+  export_to_excel({ path, targetDevice, timeRangeSeconds, username, projectName })  → number
+  logout_user()                                       → void
+  set_diagnostics_enabled({ enabled })                → void
+  get_notification_email()                            → string
+  save_notification_email({ email })                  → void
+  get_export_path()                                   → string
+  save_export_path({ path })                          → void
+
+Events listened (via listenApi):
+  "meter-data"       → MeterReading  (updates readings + history maps)
+  "status-changed"   → StatusEvent   (updates pollState)
+  "meter-fault"      → FaultEvent    (shows toast)
+  "diag-frame"       → DiagEvent     (appends to DiagTerminal lines)
+
+TypeScript interfaces defined in App.tsx:
+  RegisterEntry, MeterProfile, DeviceConfig, MeterReading,
+  FaultEvent, StatusEvent, AuthState, DiagEvent, BuildInfo
+
+Type aliases: PollState, Theme, ExportStatus, ChartPoint, ViewMode
+
+Design system:
+  CLR       — token object (bgPage, bgCard, bgHeader, bgTabBar, border, text1/2/3, brand accents)
+  glass()   — glassmorphism CSSProperties helper (backdrop-filter blur, translucent background)
+  DOT_GRID_CSS — injected dot-grid page background (CSS custom properties per theme)
+
+--- src-tauri/src/lib.rs ---
+Single function: pub fn run()
+  Bootstraps Tauri: plugin opener, invoke_handler![greet]
+  Note: this is the scaffolding stub — actual app logic lives in main.rs.
+
+--- src-tauri/src/main.rs ---
+Product: TechniDAQ Phase 4 (Multi-Meter SCADA Engine)
+
+Shared state (Tauri-managed, Arc<Mutex<_>>):
+  SharedEngine      — EngineState { poll: PollState, configured_devices: Vec<DeviceConfig> }
+  DbConnection      — rusqlite::Connection (WAL mode, technidaq_local.db in app local data dir)
+  ProfilesState     — HashMap<String, MeterProfileEntry> (loaded from profiles.json at startup)
+  WsClients         — Vec<UnboundedSender<String>> (connected intranet web clients)
+  DiagEnabled       — Arc<AtomicBool> (toggle for Modbus frame diagnostics)
+
+Key enums / structs:
+  PollState         — Stopped | Running | Fault
+  Protocol          — Rtu | Tcp
+  ConnKey           — Rtu(com_port, baud_rate) | Tcp(ip_address, tcp_port)
+  DeviceConfig      — device_name, meter_model, slave_id, poll_rate_ms, selected_registers,
+                       alarm_trigger_cycles, protocol, com_port, baud_rate, ip_address, tcp_port
+  MeterProfileEntry — model, display_name, endianness, baud_rate, parity, registers
+  RegisterEntry     — name, address, length, data_type, multiplier, min_alarm, max_alarm
+  MeterReading      — device_name, device_id, timestamp_ms, data: HashMap<String, f64>
+  FaultEvent        — device_name, reason, timestamp_ms
+  StatusEvent       — state: PollState
+  DiagEvent         — direction (TX/RX), hex, device_name, timestamp_ms
+  AuthState         — valid, username, project_name, expiry_date, allowed_meters,
+                       mode, tier, protocols, cloud_registered
+  LicensePayload    — created_at, duration_days, ttl_hours, username, project_name,
+                       allowed_meters, mode, tier, protocols
+  BuildInfo         — is_cloud_build: bool
+
+#[tauri::command] functions:
+  fn  toggle_polling(engine: State<SharedEngine>, app_handle: AppHandle, ws: State<WsClients>)
+        -> Result<PollState, String>
+  fn  get_status(engine: State<SharedEngine>)
+        -> Result<PollState, String>
+  async fn logout_user(db: State<DbConnection>)
+        -> Result<(), String>
+  fn  clear_history(db: State<DbConnection>)
+        -> Result<usize, String>
+  fn  get_record_count(db: State<DbConnection>)
+        -> Result<i64, String>
+  fn  save_notification_email(email: String, db: State<DbConnection>)
+        -> Result<(), String>
+  fn  get_notification_email(db: State<DbConnection>)
+        -> Result<String, String>
+  fn  save_export_path(path: String, db: State<DbConnection>)
+        -> Result<(), String>
+  fn  get_export_path(db: State<DbConnection>)
+        -> Result<String, String>
+  fn  set_diagnostics_enabled(enabled: bool, diag: State<DiagEnabled>)
+        -> Result<(), String>
+  fn  export_to_excel(path: String, target_device: Option<String>,
+        time_range_seconds: Option<u64>, username: String, project_name: String,
+        db: State<DbConnection>)
+        -> Result<i64, String>
+  fn  get_build_info()
+        -> BuildInfo
+  async fn activate_license(key: String, username: String, project_name: String,
+        db: State<DbConnection>)
+        -> Result<String, String>
+  fn  get_auth_state(db: State<DbConnection>)
+        -> Result<AuthState, String>
+  fn  get_meter_profiles(allowed_meters: Vec<String>, profiles_state: State<ProfilesState>)
+        -> Result<Vec<MeterProfileEntry>, String>
+  fn  reload_profiles(profiles_state: State<ProfilesState>)
+        -> Result<usize, String>
+  fn  apply_bus_config(devices: Vec<DeviceConfig>, profiles_state: State<ProfilesState>,
+        engine: State<SharedEngine>, ws: State<WsClients>)
+        -> Result<Vec<DeviceConfig>, String>
+
+Internal async helpers (not commands):
+  async fn run_polling_loop(...)          — main RS485/TCP polling task (Tokio background task)
+  async fn read_one_register(...)         — single Modbus register read
+  async fn poll_device_registers(...)     — all registers for one device per poll tick
+  async fn send_alarm_email(...)          — SMTP alarm notify (#[cfg(feature="cloud_sync")])
+
+Byte-order helpers:
+  fn regs_to_f32(regs, endian)            — Float32 with ABCD/CDAB/BADC/DCBA byte swap
+  fn decode_register(regs, endian, dtype, mult) — dispatches Float32/UInt16/UInt32/INT16/INT32
+
+License helpers:
+  fn load_profiles_from_disk()            — probes exe-dir / src-tauri / cwd for profiles.json
+  fn custom_profile()                     — always-injected "Custom" meter entry
+  fn simulation_profile()                 — injected when license permits "Simulation"/"All"
+  fn normalize_meter_name(s)              — lowercase + spaces/hyphens → underscores
+  fn now_secs()                           — UNIX timestamp (seconds)
+
+Intranet web server (Axum, spawned as Tokio task on startup):
+  POST /api/:cmd    → api_dispatch   (bridges to same command logic as Tauri IPC)
+  GET  /ws          → ws_handler     (WebSocket; pushes meter-data / status JSON frames)
+  GET  /*           → web_handler    (serves embedded React SPA via rust-embed)
+
+Events emitted to frontend:
+  "meter-data"      — MeterReading payload (on each successful device poll)
+  "meter-fault"     — FaultEvent payload (on Modbus error)
+  "status-changed"  — StatusEvent payload (on poll state transitions)
+  "diag-frame"      — DiagEvent payload (when diagnostics enabled; TX/RX hex frames)
+
+Database schema (recreated fresh on each startup, no migrations):
+  meter_history  (id INTEGER PK, timestamp TEXT, device_name TEXT,
+                  device_id TEXT, data TEXT/JSON)
+  settings       (id INTEGER PK, username TEXT, project_name TEXT,
+                  expiry_date INTEGER, allowed_meters TEXT/JSON)
+  kv             (key TEXT PK, value TEXT)   — used for notification_email, export_path, etc.
+
+Feature flags (Cargo.toml):
+  default    = []                            — offline/air-gapped build (no cloud code compiled)
+  cloud_sync = ["dep:lettre","dep:reqwest"]  — enables SMTP alarm email + cloud API registration
+
+Window behaviour:
+  CloseRequested on "main" window → hide to system tray (does not quit)
+  Tray menu: "Open Dashboard" | "Quit TechniDAQ"
+  Double-click tray icon → show window
+
+--- src-tauri/Cargo.toml ---
+[package]
+  name    = "powermeter-demo"
+  version = "0.1.0"
+  edition = "2021"
+
+[lib]
+  name       = "powermeter_demo_lib"
+  crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+  default    = []
+  cloud_sync = ["dep:lettre", "dep:reqwest"]
+
+[dependencies]  (key crates)
+  tauri               = "2"  (features: tray-icon)
+  tauri-plugin-opener = "2"
+  tauri-plugin-dialog = "2"
+  serde               = "1"  (derive)
+  serde_json          = "1"
+  rusqlite            = "0.31"  (bundled SQLite)
+  rust_xlsxwriter     = "0.80"
+  tokio               = "1"  (rt, rt-multi-thread, time, io-util, net)
+  tokio-serial        = "5.4"
+  tokio-modbus        = "0.7"  (rtu, tcp; no default features)
+  aes-gcm             = "0.10"
+  base64              = "0.21"
+  axum                = "0.7"  (macros, ws)
+  tower-http          = "0.5"  (cors, fs)
+  rust-embed          = "8"    (mime-guess)
+  mime_guess          = "2"
+  sha2                = "0.10"
+  chrono              = "0.4"  (clock)
+  lettre              = "0.11"  (optional, cloud_sync feature only)
+  reqwest             = "0.12"  (optional, cloud_sync feature only)
+
+[profile.release]
+  panic="abort", codegen-units=1, lto=true, opt-level="s", strip=true
+
+--- src-tauri/tauri.conf.json ---
+  productName : "TechniDAQ"
+  version     : "0.1.0"
+  identifier  : "com.technicatgroup.technidaq"
+  build.devUrl: "http://localhost:1420"
+  build.frontendDist: "../dist"
+  app.withGlobalTauri: false
+  app.trayIcon: icons/icon.ico
+  app.windows[0]:
+    label: "main"  title: "TechniDAQ — Technicat Group"
+    width: 1280  height: 800  minWidth: 900  minHeight: 600
+  bundle.targets: "all"
+  bundle.icon: 32x32.png, 128x128.png, 128x128@2x.png, icon.icns, icon.ico
+
+--- src-tauri/capabilities/default.json ---
+  identifier: "default"
+  windows:    ["main"]
+  permissions: ["core:default", "opener:default", "dialog:default"]
+
+--- src-tauri/profiles.json ---
+External (not compiled in). Loaded at runtime; hot-reloadable via reload_profiles command.
+Search order: exe-dir → src-tauri/profiles.json → cwd/profiles.json
+
+Profiles defined:
+  Schneider_PM2220  — endianness: ABCD, baud: 19200, parity: Even
+                      38 registers (current A/B/C/N/avg, voltage L-L & L-N, power factor,
+                      active/reactive/apparent power, frequency, energy totals)
+
+  Socomec_Diris_A40 — endianness: CDAB, baud: 9600, parity: Even
+                      30 registers (voltage L-L & L-N, current, active/reactive/apparent power,
+                      power factor, frequency, energy); power registers use multiplier 0.001
+
+  Lovato_DMG        — endianness: ABCD, baud: 19200, parity: None
+                      30 registers (voltage L-L & L-N, current, frequency,
+                      active/reactive/apparent power, power factor, energy)
+
+Virtual profiles (always available, injected in code):
+  Custom      — user-defined registers, no hardware profile
+  Simulation  — no registers (simulated data); requires "Simulation" or "All" in license
+
+--- src-tauri/build.rs ---
+  Calls tauri_build::build() — standard Tauri build script, no customisation.
+
+--- package.json ---
+  name     : "powermeter-demo"
+  version  : "0.1.0"
+  type     : "module"
+  scripts  :
+    dev     → "vite"
+    build   → "tsc && vite build"
+    preview → "vite preview"
+    tauri   → "tauri"
+  dependencies:
+    @tauri-apps/api              ^2
+    @tauri-apps/plugin-dialog    ^2.6.0
+    @tauri-apps/plugin-opener    ^2
+    react                        ^19.1.0
+    react-dom                    ^19.1.0
+    recharts                     ^3.8.0
+  devDependencies (key):
+    @vitejs/plugin-react         ^4.6.0
+    tailwindcss                  ^3.4.19
+    typescript                   ~5.8.3
+    vite                         ^7.0.4
+    @tauri-apps/cli              ^2
+
+--- tsconfig.json ---
+  target           : ES2020
+  module           : ESNext
+  moduleResolution : bundler
+  jsx              : react-jsx
+  strict           : true
+  noEmit           : true
+  include          : ["src"]
+
+--- vite.config.ts ---
+  plugins  : [react()]
+  server   : port 1420, strictPort, host from TAURI_DEV_HOST env var
+  hmr      : ws on port 1421 when TAURI_DEV_HOST is set
+  watch    : ignores src-tauri/**
+
+--- generate_license.cjs ---
+CLI tool (Node.js, not part of app bundle).
+Usage: node generate_license.cjs --days N --username NAME --project NAME --meters MODEL,...
+  Generates AES-256-GCM encrypted license tokens.
+  Uses same MASTER_KEY_HEX as main.rs.
+  Tokens include ttl_hours=1 (expire 60 min after generation — must be activated immediately).
+  Accepts "All" as meter list to unlock all profiles.
+
+================================================================================
+ARCHITECTURE OVERVIEW
+================================================================================
+
+LAYER DIAGRAM
+-------------
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  React 19 + TypeScript Frontend  (src/App.tsx)              │
+  │  - Single component file; sub-components defined inline     │
+  │  - Recharts for historical waveform charts                  │
+  │  - Tailwind CSS v3 + custom glassmorphism design system     │
+  │  - Auth-gated: all controls disabled until license valid    │
+  └────────────────┬────────────────────────┬───────────────────┘
+                   │ Tauri IPC              │ fetch POST /api/*
+                   │ invoke() / listen()    │ (web/intranet mode)
+  ┌────────────────▼────────────────────────▼───────────────────┐
+  │  src/api.ts  "Chameleon Bridge"                             │
+  │  - invokeApi(): routes to Tauri IPC or Axum REST            │
+  │  - listenApi(): routes to Tauri events or no-op stub        │
+  └────────────────┬────────────────────────────────────────────┘
+                   │
+  ┌────────────────▼────────────────────────────────────────────┐
+  │  Rust Backend  (src-tauri/src/main.rs)                      │
+  │                                                             │
+  │  Tauri Commands (IPC)          Axum HTTP Server             │
+  │  ─────────────────────         ────────────────────────     │
+  │  toggle_polling                POST /api/:cmd               │
+  │  apply_bus_config              GET  /ws  (WebSocket)        │
+  │  get_meter_profiles            GET  /*   (embedded SPA)     │
+  │  reload_profiles                                            │
+  │  get_status / get_build_info                                │
+  │  activate_license                                           │
+  │  get_auth_state / logout_user                               │
+  │  export_to_excel                                            │
+  │  clear_history / get_record_count                           │
+  │  save/get_notification_email                                │
+  │  save/get_export_path                                       │
+  │  set_diagnostics_enabled                                    │
+  │                                                             │
+  │  Polling Loop (Tokio task)                                  │
+  │  ─────────────────────────                                  │
+  │  - TICK_MS=50ms wake cycle                                  │
+  │  - One serial port per RTU bus; ctx.set_slave() per device  │
+  │  - RS485_TURNAROUND_MS=25ms inter-device gap                │
+  │  - Emits: meter-data, meter-fault, status-changed events    │
+  │  - Also pushes JSON frames to WebSocket clients             │
+  │  - Auto-retry on fault after 2 s                            │
+  │                                                             │
+  │  Shared State                                               │
+  │  ─────────────────────────                                  │
+  │  SharedEngine   — PollState + configured devices            │
+  │  DbConnection   — SQLite WAL (meter_history + settings + kv)│
+  │  ProfilesState  — meter profile library (runtime JSON)      │
+  │  WsClients      — connected intranet web socket senders     │
+  │  DiagEnabled    — atomic bool for hex frame diagnostics     │
+  └────────────────┬────────────────────────────────────────────┘
+                   │ Modbus RTU (RS485 serial)
+                   │ Modbus TCP (ethernet)
+  ┌────────────────▼────────────────────────────────────────────┐
+  │  Physical Power Meters                                      │
+  │  Schneider PM2220  |  Socomec Diris A40  |  Lovato DMG610   │
+  │  (or any Custom-defined Modbus device)                      │
+  └─────────────────────────────────────────────────────────────┘
+
+DATA FLOW
+---------
+1. User activates license key → activate_license decrypts AES-256-GCM token,
+   stores validated auth in settings table.
+2. User configures devices (model, slave ID, COM port / IP, registers) →
+   apply_bus_config validates and stores in EngineState.
+3. User clicks Start → toggle_polling launches run_polling_loop as a Tokio task.
+4. Polling loop reads Modbus registers → emits "meter-data" events (Tauri)
+   and pushes JSON to WebSocket clients (web mode).
+5. Frontend receives events → updates readings Map + 60-point history buffer →
+   re-renders MetricCard grid and WaveformChart.
+6. On fault → "meter-fault" + "status-changed" events → Toast + tab indicator;
+   loop auto-retries after 2 s.
+7. User requests export → export_to_excel queries meter_history, writes .xlsx
+   via rust_xlsxwriter.
+8. Intranet web server (Axum) lets phones/tablets on the same network use the
+   same React SPA served from the embedded binary, tunnelling commands via REST.
+
+DUAL-MODE DEPLOYMENT
+--------------------
+  Desktop (Tauri native):  invoke() / listen() IPC — zero network traffic
+  Web/Intranet (browser):  fetch POST /api/<cmd>   — served by embedded Axum server
+  Both modes share identical React frontend; api.ts abstracts the difference.
+
+LICENSE SYSTEM
+--------------
+  - AES-256-GCM encrypted tokens generated by generate_license.cjs (offline tool)
+  - Same MASTER_KEY_HEX in generator and Rust backend
+  - Token fields: created_at, duration_days, ttl_hours=1, username, project_name,
+    allowed_meters, mode (offline/online), tier (1/2/3), protocols (RTU/TCP/All)
+  - Activation window: 60 minutes from generation
+  - Stored in DB settings table; expiry checked on every get_auth_state call
+  - cloud_sync feature flag: enables SMTP alarm email + cloud API calls (optional build)

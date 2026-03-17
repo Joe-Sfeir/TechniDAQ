@@ -41,15 +41,15 @@ use tokio_serial::SerialStream;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const MASTER_KEY_HEX:       &str = "6f3d9a2e1b8c4f7a0e5d2b9c6a3f1e8d4b7c0a9e2f5d8b1c4a7e0f3d6b9c2a5f";
+const MASTER_KEY_HEX:       &str = "d12a45fa8285f9d64a696ec883d0d429c7581d520bd4a92b801ff3c7f953d8ca";
 #[cfg(feature = "cloud_sync")]
-const CLOUD_API_URL: &str = "https://technicloudapi.onrender.com";
+const CLOUD_API_URL: &str = "technicloudapi-production.up.railway.app";
 #[cfg(feature = "cloud_sync")]
 const SMTP_HOST: &str = "smtp.gmail.com";
 #[cfg(feature = "cloud_sync")]
 const SMTP_USER: &str = "joesfeir007@gmail.com";
 #[cfg(feature = "cloud_sync")]
-const SMTP_PASS: &str = "drrx vrdk elac oprp";
+const SMTP_PASS: &str = "bhut umaf dpdw bruo";
 const PORT_TIMEOUT_MS:      u64  = 500;
 /// Minimum gap between consecutive Modbus frames on the same RS485 bus (turnaround time).
 const RS485_TURNAROUND_MS:  u64  = 25;
