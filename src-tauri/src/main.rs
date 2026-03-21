@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use chrono::Timelike;
+use chrono::{Local, Timelike};
 #[cfg(feature = "cloud_sync")]
 use lettre::{message::header::ContentType, transport::smtp::authentication::Credentials, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 #[cfg(feature = "cloud_sync")]
@@ -43,7 +43,7 @@ use tokio_serial::SerialStream;
 
 const MASTER_KEY_HEX:       &str = "d12a45fa8285f9d64a696ec883d0d429c7581d520bd4a92b801ff3c7f953d8ca";
 #[cfg(feature = "cloud_sync")]
-const CLOUD_API_URL: &str = "technicloudapi-production.up.railway.app";
+const CLOUD_API_URL: &str = "https://technicloudapi-production.up.railway.app";
 #[cfg(feature = "cloud_sync")]
 const SMTP_HOST: &str = "smtp.gmail.com";
 #[cfg(feature = "cloud_sync")]
@@ -342,16 +342,10 @@ fn decode_register(regs: &[u16], endian: &str, dtype: &str, multiplier: f64) -> 
 
 // ─── Misc Helpers ─────────────────────────────────────────────────────────────
 
+/// Returns the current local time as an RFC 3339 string with explicit UTC offset,
+/// e.g. `2026-03-21T15:00:00+03:00`. The cloud API requires an explicit offset.
 fn wall_clock_iso() -> String {
-    secs_to_iso(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
-}
-
-/// Convert a Unix timestamp (seconds) to the `YYYY-MM-DDTHH:MM:SS` format
-/// used in the `meter_history.timestamp` column — enabling direct string comparison.
-fn secs_to_iso(s0: u64) -> String {
-    let (s, m, h) = (s0%60, (s0/60)%60, (s0/3600)%24);
-    let d = s0/86400; let yr = 1970+d/365; let mo = (d%365)/30+1; let dy = (d%365)%30+1;
-    format!("{yr:04}-{mo:02}-{dy:02}T{h:02}:{m:02}:{s:02}")
+    Local::now().to_rfc3339()
 }
 
 fn now_ms()   -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() }
@@ -518,8 +512,10 @@ async fn logout_user(db: State<'_, DbConnection>) -> Result<(), String> {
 
 #[tauri::command]
 fn clear_history(db: State<DbConnection>) -> Result<usize, String> {
-    db.0.lock().map_err(|e| e.to_string())?
-       .execute("DELETE FROM meter_history", []).map_err(|e| e.to_string())
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let n1 = conn.execute("DELETE FROM meter_history", []).map_err(|e| e.to_string())?;
+    let n2 = conn.execute("DELETE FROM device_config",  []).map_err(|e| e.to_string())?;
+    Ok(n1 + n2)
 }
 
 #[tauri::command]
@@ -870,7 +866,7 @@ fn export_to_excel(
     project_name:       String,
     db:                 State<DbConnection>,
 ) -> Result<usize, String> {
-    let ts_from = time_range_seconds.map(|s| secs_to_iso(now_secs().saturating_sub(s)));
+    let ts_from = time_range_seconds.map(|s| (Local::now() - chrono::Duration::seconds(s as i64)).to_rfc3339());
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     do_export(&conn, &path, target_device.as_deref(), ts_from.as_deref(), None, &username, &project_name)
 }
@@ -1109,13 +1105,14 @@ fn reload_profiles(profiles_state: State<ProfilesState>) -> Result<usize, String
 }
 
 /// Accept an array of fully-configured device slots from the frontend.
-/// Validates each entry and stores them in engine state.
+/// Validates each entry, stores them in engine state, and persists to SQLite.
 #[tauri::command]
 fn apply_bus_config(
     devices:        Vec<DeviceConfig>,
     profiles_state: State<ProfilesState>,
     engine:         State<SharedEngine>,
     ws:             State<WsClients>,
+    db:             State<DbConnection>,
 ) -> Result<Vec<DeviceConfig>, String> {
     if devices.is_empty() { return Err("At least one device must be configured.".into()); }
 
@@ -1157,9 +1154,69 @@ fn apply_bus_config(
         let mut eng = engine.0.lock().map_err(|e| e.to_string())?;
         eng.configured_devices = devices.clone();
     }
+    // Persist bus config (including alarm thresholds) so it survives restarts.
+    {
+        let json = serde_json::to_string(&devices).map_err(|e| e.to_string())?;
+        db.0.lock().map_err(|e| e.to_string())?
+            .execute(
+                "INSERT OR REPLACE INTO device_config (id, config_json) VALUES (1, ?1)",
+                params![json],
+            ).map_err(|e| e.to_string())?;
+    }
     eprintln!("[engine] Bus config: {} devices, {} total registers", devices.len(), total_regs);
     ws_broadcast(&ws.0, build_state_msg(&engine.0));
     Ok(devices)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryReading {
+    pub device_name:  String,
+    pub device_id:    String,
+    pub timestamp_ms: i64,
+    pub data:         HashMap<String, f64>,
+}
+
+#[tauri::command]
+fn get_recent_history(
+    device_name: String,
+    limit: i64,
+    db: State<DbConnection>,
+) -> Result<Vec<HistoryReading>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare(
+        "SELECT timestamp, device_name, device_id, data \
+         FROM meter_history WHERE device_name = ?1 \
+         ORDER BY timestamp DESC LIMIT ?2",
+    ).map_err(|e| e.to_string())?;
+    let mut rows: Vec<HistoryReading> = stmt
+        .query_map(params![device_name, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .filter_map(|(ts, dn, di, data_str)| {
+            let ts_ms = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S")
+                .ok()?.and_utc().timestamp_millis();
+            let data: HashMap<String, f64> = serde_json::from_str(&data_str).ok()?;
+            Some(HistoryReading { device_name: dn, device_id: di, timestamp_ms: ts_ms, data })
+        })
+        .collect();
+    rows.reverse(); // ascending chronological order
+    Ok(rows)
+}
+
+#[tauri::command]
+fn get_saved_bus_config(db: State<DbConnection>) -> Result<Vec<DeviceConfig>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let json: String = conn
+        .query_row("SELECT config_json FROM device_config WHERE id = 1", [], |r| r.get(0))
+        .unwrap_or_else(|_| "[]".to_string());
+    serde_json::from_str(&json).map_err(|e| e.to_string())
 }
 
 // ─── Async Register Read ──────────────────────────────────────────────────────
@@ -1827,7 +1884,7 @@ async fn run_cloud_sync_loop(db: Arc<Mutex<Connection>>, client: HttpClient) {
         // ── 48-hour pruning of already-synced rows ─────────────────────────
         // Uses our ISO timestamp format for correct string comparison.
         {
-            let cutoff = secs_to_iso(now_secs().saturating_sub(172_800));
+            let cutoff = (Local::now() - chrono::Duration::seconds(172_800)).to_rfc3339();
             let conn = db.lock().unwrap();
             let _ = conn.execute(
                 "DELETE FROM meter_history WHERE synced = 1 AND timestamp < ?1",
@@ -1937,6 +1994,13 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS app_config (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT ''
+        );
+
+        -- Persists the full bus configuration (devices + alarm thresholds) as a
+        -- single JSON row so it survives app restarts.
+        CREATE TABLE IF NOT EXISTS device_config (
+            id          INTEGER PRIMARY KEY,
+            config_json TEXT NOT NULL
         );
     ")?;
 
@@ -2226,8 +2290,26 @@ async fn api_dispatch(
                 }
             }
             s.engine.lock().map_err(api_e500)?.configured_devices = devices.clone();
+            // Persist bus config (including alarm thresholds) to SQLite.
+            {
+                let json = serde_json::to_string(&devices).map_err(api_e500)?;
+                s.db.lock().map_err(api_e500)?
+                    .execute(
+                        "INSERT OR REPLACE INTO device_config (id, config_json) VALUES (1, ?1)",
+                        params![json],
+                    ).map_err(api_e500)?;
+            }
             let broadcast = build_state_msg(&s.engine);
             ws_broadcast(&s.ws_clients, broadcast);
+            ok(serde_json::to_value(devices).unwrap())
+        }
+
+        "get_saved_bus_config" => {
+            let json: String = s.db.lock().map_err(api_e500)?
+                .query_row("SELECT config_json FROM device_config WHERE id = 1", [],
+                           |r: &rusqlite::Row<'_>| r.get(0))
+                .unwrap_or_else(|_| "[]".to_string());
+            let devices: Vec<DeviceConfig> = serde_json::from_str(&json).unwrap_or_default();
             ok(serde_json::to_value(devices).unwrap())
         }
 
@@ -2408,6 +2490,16 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let r1 = w.unminimize();
+                let r2 = w.show();
+                let r3 = w.set_focus();
+                eprintln!("[single-instance] restore: unminimize={r1:?} show={r2:?} focus={r3:?}");
+            } else {
+                eprintln!("[single-instance] window 'main' not found");
+            }
+        }))
         .setup(|app| {
             // ── Database ─────────────────────────────────────────────────────
             let dir = app.path().app_local_data_dir().expect("app data dir");
@@ -2447,13 +2539,30 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, ev| match ev.id.as_ref() {
-                    "show" => { if let Some(w) = app.get_webview_window("main") { let _=w.show(); let _=w.set_focus(); } }
+                    "show" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let r1 = w.unminimize();
+                            let r2 = w.show();
+                            let r3 = w.set_focus();
+                            eprintln!("[tray] menu restore: unminimize={r1:?} show={r2:?} focus={r3:?}");
+                        } else {
+                            eprintln!("[tray] menu: window 'main' not found");
+                        }
+                    }
                     "quit" => std::process::exit(0),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, ev| {
                     if let tauri::tray::TrayIconEvent::DoubleClick { .. } = ev {
-                        if let Some(w) = tray.app_handle().get_webview_window("main") { let _=w.show(); let _=w.set_focus(); }
+                        let handle = tray.app_handle().clone();
+                        if let Some(w) = handle.get_webview_window("main") {
+                            let r1 = w.unminimize();
+                            let r2 = w.show();
+                            let r3 = w.set_focus();
+                            eprintln!("[tray] double-click restore: unminimize={r1:?} show={r2:?} focus={r3:?}");
+                        } else {
+                            eprintln!("[tray] double-click: window 'main' not found");
+                        }
                     }
                 })
                 .build(app)?;
@@ -2515,7 +2624,7 @@ fn main() {
             get_build_info,
             toggle_polling, get_status, clear_history, get_record_count, export_to_excel,
             activate_license, get_auth_state, logout_user,
-            get_meter_profiles, reload_profiles, apply_bus_config,
+            get_meter_profiles, reload_profiles, apply_bus_config, get_saved_bus_config, get_recent_history,
             save_notification_email, get_notification_email,
             set_diagnostics_enabled,
             save_export_path, get_export_path,

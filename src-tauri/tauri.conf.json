@@ -11,10 +11,6 @@
   },
   "app": {
     "withGlobalTauri": false,
-    "trayIcon": {
-      "iconPath":      "icons/icon.ico",
-      "iconAsTemplate": false
-    },
     "windows": [
       {
         "label":           "main",
@@ -39,7 +35,8 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources":       ["profiles.json"]
   },
   "plugins": {
   }

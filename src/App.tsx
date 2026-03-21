@@ -1109,20 +1109,38 @@ interface CustomRegDraft {
 }
 const EMPTY_DRAFT:CustomRegDraft = {name:"",address:"",length:"2",data_type:"Float32",multiplier:"1.0"};
 
-function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove,licensedProtocols }:{
+function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove,licensedProtocols,fieldErrors }:{
   device:DeviceConfig; index:number; profiles:MeterProfile[]; isDark:boolean;
   onUpdate:(d:DeviceConfig)=>void; onRemove:()=>void;
   licensedProtocols?: "RTU" | "TCP" | "All";
+  fieldErrors?: Set<string>;
 }) {
   const [expanded,  setExpanded]  = useState(index===0);
+  useEffect(()=>{ if(fieldErrors && fieldErrors.size>0) setExpanded(true); },[fieldErrors]);
   const [search,    setSearch]    = useState("");
   const [checked,   setChecked]   = useState<Set<string>>(
     ()=>new Set(device.selected_registers.map(r=>r.name))
   );
-  const [customRegs,setCustomRegs]= useState<RegisterEntry[]>([]);
+  const [customRegs,setCustomRegs]= useState<RegisterEntry[]>(()=>{
+    const profileNames = new Set(
+      (profiles.find(p=>p.model===device.meter_model)?.registers??[]).map(r=>r.name)
+    );
+    return device.selected_registers.filter(r=>!profileNames.has(r.name));
+  });
   const [draft,     setDraft]     = useState<CustomRegDraft>(EMPTY_DRAFT);
   const [draftErr,  setDraftErr]  = useState<string|null>(null);
-  const [alarms,    setAlarms]    = useState<Record<string, {min?:string, max?:string}>>({});
+  const [alarms,    setAlarms]    = useState<Record<string, {min?:string, max?:string}>>(()=>{
+    const init: Record<string, {min?:string, max?:string}> = {};
+    for (const r of device.selected_registers) {
+      if (r.min_alarm !== undefined || r.max_alarm !== undefined) {
+        init[r.name] = {
+          min: r.min_alarm !== undefined ? String(r.min_alarm) : undefined,
+          max: r.max_alarm !== undefined ? String(r.max_alarm) : undefined,
+        };
+      }
+    }
+    return init;
+  });
 
   const profile     = profiles.find(p=>p.model===device.meter_model);
   const profileRegs = profile?.registers??[];
@@ -1137,6 +1155,9 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove,licensedPr
   const allOn    = allNames.length>0 && allNames.every(n=>checked.has(n));
 
   useEffect(()=>{
+    // Guard: if the profile hasn't loaded yet but the device already has saved
+    // registers, skip the update — otherwise we'd wipe the saved selection.
+    if(profileRegs.length===0 && device.selected_registers.length>0) return;
     const regs = [...profileRegs,...customRegs].filter(r=>checked.has(r.name)).map(r=>({
       ...r,
       min_alarm: alarms[r.name]?.min !== undefined && alarms[r.name]!.min !== "" ? parseFloat(alarms[r.name]!.min!) : undefined,
@@ -1184,6 +1205,8 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove,licensedPr
     color:CLR.text1(isDark),fontFamily:"'Share Tech Mono',monospace",
     fontSize:"0.7rem",letterSpacing:"0.04em",outline:"none",padding:"0 8px",width:"100%",
   };
+  const fe = (field:string): React.CSSProperties =>
+    fieldErrors?.has(field) ? {border:`1px solid ${CLR.red}`} : {};
   const lS: React.CSSProperties = {
     display:"block",marginBottom:"4px",
     fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",
@@ -1234,11 +1257,11 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove,licensedPr
             <div>
               <label style={lS}>Device Name</label>
               <input type="text" value={device.device_name} placeholder='"Main Incomer"'
-                style={iS} onChange={e=>onUpdate({...device,device_name:e.target.value})}/>
+                style={{...iS,...fe('device_name')}} onChange={e=>onUpdate({...device,device_name:e.target.value})}/>
             </div>
             <div>
               <label style={lS}>Meter Model</label>
-              <select value={device.meter_model} style={{...iS,cursor:"pointer"}}
+              <select value={device.meter_model} style={{...iS,cursor:"pointer",...fe('meter_model')}}
                 onChange={e=>handleModelChange(e.target.value)}>
                 <option value="" disabled>Select model…</option>
                 {profiles.map(p=><option key={p.model} value={p.model}>{p.display_name}</option>)}
@@ -1247,7 +1270,7 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove,licensedPr
             <div>
               <label style={lS}>Slave ID</label>
               <input type="number" min={1} max={247} value={device.slave_id}
-                style={{...iS,textAlign:"center"}}
+                style={{...iS,textAlign:"center",...fe('slave_id')}}
                 onChange={e=>{const v=parseInt(e.target.value,10);if(v>=1&&v<=247)onUpdate({...device,slave_id:v});}}/>
             </div>
             <div>
@@ -1296,7 +1319,9 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove,licensedPr
             {device.protocol==="rtu" ? <>
               <div>
                 <label style={lS}>COM Port</label>
-                <ComPortSelector value={device.com_port} onChange={v=>onUpdate({...device,com_port:v})} disabled={false} isDark={isDark}/>
+                <div style={fieldErrors?.has('com_port') ? {outline:`1px solid ${CLR.red}`,borderRadius:"5px"} : {}}>
+                  <ComPortSelector value={device.com_port} onChange={v=>onUpdate({...device,com_port:v})} disabled={false} isDark={isDark}/>
+                </div>
               </div>
               <div>
                 <label style={lS}>Baud Rate</label>
@@ -1309,7 +1334,7 @@ function DevicePanel({ device,index,profiles,isDark,onUpdate,onRemove,licensedPr
               <div>
                 <label style={lS}>IP Address</label>
                 <input type="text" value={device.ip_address} placeholder="192.168.1.50"
-                  style={iS} onChange={e=>onUpdate({...device,ip_address:e.target.value})}/>
+                  style={{...iS,...fe('ip_address')}} onChange={e=>onUpdate({...device,ip_address:e.target.value})}/>
               </div>
               <div>
                 <label style={lS}>TCP Port</label>
@@ -1514,10 +1539,11 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme,license
       ? initialDevices
       : [{...DEFAULT_DEVICE(),meter_model:profiles[0]?.model??""}]
   );
-  const [notifEmail, setNotifEmail] = useState("");
-  const [emailSaved, setEmailSaved] = useState(false);
-  const [exportDir,  setExportDir]  = useState("");
-  const [dirSaved,   setDirSaved]   = useState(false);
+  const [notifEmail,   setNotifEmail]   = useState("");
+  const [emailSaved,   setEmailSaved]   = useState(false);
+  const [exportDir,    setExportDir]    = useState("");
+  const [dirSaved,     setDirSaved]     = useState(false);
+  const [fieldErrors,  setFieldErrors]  = useState<Record<number,Set<string>>>({});
 
   useEffect(()=>{
     invokeApi<string>("get_notification_email").then(setNotifEmail).catch(()=>{});
@@ -1529,15 +1555,23 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme,license
   const addDevice = () => setDevices(p=>[...p,{...DEFAULT_DEVICE(),meter_model:profiles[0]?.model??""}]);
 
   const handleSave = () => {
-    for(const d of devices){
-      if(!d.device_name.trim()){alert("A device is missing a name.");return;}
-      if(!d.meter_model){alert(`"${d.device_name}" — select a meter model.`);return;}
-      if(d.slave_id<1||d.slave_id>247){alert(`"${d.device_name}" — Slave ID must be 1–247.`);return;}
-      if(d.selected_registers.length===0){alert(`"${d.device_name}" — select at least one register.`);return;}
+    const errors: Record<number,Set<string>> = {};
+    for(let i=0;i<devices.length;i++){
+      const d=devices[i];
+      const e=new Set<string>();
+      if(!d.device_name.trim())                              e.add('device_name');
+      if(!d.meter_model)                                     e.add('meter_model');
+      if(d.slave_id<1||d.slave_id>247)                      e.add('slave_id');
+      if(d.protocol==="rtu" && !d.com_port.trim())          e.add('com_port');
+      if(d.protocol==="tcp" && !d.ip_address.trim())        e.add('ip_address');
+      if(e.size>0) errors[i]=e;
     }
+    if(Object.keys(errors).length>0){setFieldErrors(errors);return;}
+    // Register selection is still guarded (backend will also reject, toast handles it)
     const ids=devices.map(d=>d.slave_id);
     const dup=ids.find((id,i)=>ids.indexOf(id)!==i);
     if(dup!==undefined){alert(`Duplicate Slave ID ${dup} — each device must have a unique address.`);return;}
+    setFieldErrors({});
     onSave(devices);
   };
 
@@ -1586,7 +1620,7 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme,license
           {devices.map((dev,i)=>(
             <DevicePanel key={i} index={i} device={dev} profiles={profiles} isDark={isDark}
               onUpdate={d=>updDevice(i,d)} onRemove={()=>remDevice(i)}
-              licensedProtocols={licensedProtocols}/>
+              licensedProtocols={licensedProtocols} fieldErrors={fieldErrors[i]}/>
           ))}
           <button onClick={addDevice} style={{
             width:"100%",padding:"10px",
@@ -1718,15 +1752,12 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme,license
                   Push live readings and alarms to the TechniDAQ cloud dashboard.
                   Available for <strong>Online</strong> licenses at <strong>Tier 2</strong> or higher.
                 </div>
-                <button disabled={!isCloudEnabled} style={{
-                  alignSelf:"flex-start", height:"30px", padding:"0 16px", borderRadius:"5px",
-                  background: isCloudEnabled ? CLR.blue+"20" : "transparent",
-                  border:`1px solid ${isCloudEnabled ? CLR.blue+"50" : CLR.border(isDark)}`,
-                  color: isCloudEnabled ? CLR.blue : CLR.text3(isDark),
-                  cursor: isCloudEnabled ? "pointer" : "not-allowed",
-                  fontFamily:"'Rajdhani',sans-serif", fontWeight:700,
-                  fontSize:"0.7rem", letterSpacing:"0.08em",
-                }}>Connect to Cloud</button>
+                {isCloudEnabled && (
+                  <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.6rem",
+                    letterSpacing:"0.08em", color:CLR.green }}>
+                    &#9679; CLOUD SYNC ACTIVE
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -1771,6 +1802,20 @@ function LicenseGateway({ onActivated }:{ onActivated:(auth:AuthState)=>void }) 
   const [error,    setError]    = useState<string|null>(null);
   const [busy,     setBusy]     = useState(false);
   const [focused,  setFocused]  = useState<string|null>(null);
+  const [pendingPayload, setPendingPayload] = useState<{key:string;username:string;projectName:string}|null>(null);
+  const [existingCount,  setExistingCount]  = useState(0);
+
+  const doActivate = async (payload:{key:string;username:string;projectName:string}, clearHistory:boolean) => {
+    setBusy(true);
+    setPendingPayload(null);
+    try {
+      if(clearHistory) await invokeApi("clear_history");
+      await invokeApi<string>("activate_license", payload);
+      const auth = await invokeApi<AuthState>("get_auth_state");
+      onActivated(auth);
+    } catch(e) { setError(String(e)); }
+    finally { setBusy(false); }
+  };
 
   const activate = async () => {
     setError(null);
@@ -1780,39 +1825,15 @@ function LicenseGateway({ onActivated }:{ onActivated:(auth:AuthState)=>void }) 
     setBusy(true);
     try {
       const payload = { key: key.trim(), username: username.trim(), projectName: project.trim() };
-      let activateMsg: string;
-      let auth: AuthState;
-
-      // __TAURI_INTERNALS__ is injected by Tauri v2 in the native webview.
-      // A plain browser never has it, so the dynamic import is never attempted there.
-      if ((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) {
-        const { invoke } = await import("@tauri-apps/api/core");
-        activateMsg = await invoke<string>("activate_license", payload);
-        auth        = await invoke<AuthState>("get_auth_state");
-      } else {
-        // Web / phone path: POST to the Axum REST API on the same host, port 3030.
-        const base = `http://${window.location.hostname}:3030/api`;
-        const activateRes = await fetch(`${base}/activate_license`, {
-          method:  "POST",
-          headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify(payload),
-        });
-        if (!activateRes.ok) throw new Error(await activateRes.text());
-        activateMsg = await activateRes.json() as string;
-
-        const authRes = await fetch(`${base}/get_auth_state`, {
-          method:  "POST",
-          headers: { "Content-Type": "application/json" },
-          body:    "{}",
-        });
-        if (!authRes.ok) throw new Error(await authRes.text());
-        auth = await authRes.json() as AuthState;
+      const count = await invokeApi<number>("get_record_count");
+      if(count > 0){
+        setPendingPayload(payload);
+        setExistingCount(count);
+        setBusy(false);
+        return;
       }
-
-      console.log("[license]", activateMsg);
-      onActivated(auth);
-    } catch(e) { setError(String(e)); }
-    finally { setBusy(false); }
+      await doActivate(payload, false);
+    } catch(e) { setError(String(e)); setBusy(false); }
   };
 
   const iS = (f:string): React.CSSProperties => ({
@@ -1889,17 +1910,43 @@ function LicenseGateway({ onActivated }:{ onActivated:(auth:AuthState)=>void }) 
                 ⚠ {error}
               </div>
             )}
-            <button onClick={activate} disabled={busy} style={{
-              padding:"11px",
-              background:busy?"rgba(29,107,255,0.15)":"#1d6bff",
-              border:`1px solid ${busy?"rgba(29,107,255,0.3)":"#1d6bff"}`,
-              borderRadius:"7px",
-              color:busy?"#484f58":"#fff",
-              fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
-              fontSize:"0.85rem",letterSpacing:"0.14em",textTransform:"uppercase",
-              cursor:busy?"not-allowed":"pointer",
-              boxShadow:busy?"none":"0 4px 18px rgba(29,107,255,0.4)",
-            }}>{busy?"Activating…":"Activate License"}</button>
+            {pendingPayload ? (
+              <div style={{ padding:"12px",
+                background:"rgba(245,158,11,0.08)",border:"1px solid rgba(245,158,11,0.35)",
+                borderRadius:"7px",display:"flex",flexDirection:"column",gap:"10px" }}>
+                <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.62rem",
+                  color:"#fbbf24",letterSpacing:"0.04em",lineHeight:1.5 }}>
+                  {existingCount.toLocaleString()} records from a previous session exist in the database.
+                  Keep the existing data or clear it before activating?
+                </div>
+                <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px" }}>
+                  <button onClick={()=>doActivate(pendingPayload,false)} disabled={busy} style={{
+                    padding:"9px",background:"rgba(34,197,94,0.12)",
+                    border:"1px solid rgba(34,197,94,0.4)",borderRadius:"6px",
+                    color:"#4ade80",fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+                    fontSize:"0.78rem",letterSpacing:"0.1em",cursor:busy?"not-allowed":"pointer",
+                  }}>Keep Data</button>
+                  <button onClick={()=>doActivate(pendingPayload,true)} disabled={busy} style={{
+                    padding:"9px",background:"rgba(239,68,68,0.12)",
+                    border:"1px solid rgba(239,68,68,0.4)",borderRadius:"6px",
+                    color:"#f87171",fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+                    fontSize:"0.78rem",letterSpacing:"0.1em",cursor:busy?"not-allowed":"pointer",
+                  }}>Clear &amp; Start Fresh</button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={activate} disabled={busy} style={{
+                padding:"11px",
+                background:busy?"rgba(29,107,255,0.15)":"#1d6bff",
+                border:`1px solid ${busy?"rgba(29,107,255,0.3)":"#1d6bff"}`,
+                borderRadius:"7px",
+                color:busy?"#484f58":"#fff",
+                fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+                fontSize:"0.85rem",letterSpacing:"0.14em",textTransform:"uppercase",
+                cursor:busy?"not-allowed":"pointer",
+                boxShadow:busy?"none":"0 4px 18px rgba(29,107,255,0.4)",
+              }}>{busy?"Checking…":"Activate License"}</button>
+            )}
           </div>
         </div>
       </div>
@@ -2169,6 +2216,38 @@ export default function App() {
         .then(setProfiles)
         .catch(e=>showToast(`Failed to load profiles: ${e}`,"error"));
     }
+    // Restore persisted bus config (devices + alarm thresholds) from SQLite.
+    invokeApi<DeviceConfig[]>("get_saved_bus_config")
+      .then(devices=>{
+        if(devices.length>0){
+          setConfiguredDevices(devices);
+          setActiveTab(t=>t||devices[0].device_name);
+          // Populate charts with previous-session readings immediately.
+          Promise.all(
+            devices.map(d=>
+              invokeApi<MeterReading[]>("get_recent_history",{deviceName:d.device_name,limit:60})
+                .catch(()=>[] as MeterReading[])
+            )
+          ).then(results=>{
+            const histPatch: Record<string,ChartPoint[]>  = {};
+            const latestPatch: Record<string,MeterReading> = {};
+            devices.forEach((d,i)=>{
+              const rows=results[i];
+              if(!rows.length)return;
+              histPatch[d.device_name]=rows.map(r=>({
+                time:new Date(r.timestamp_ms).toLocaleTimeString("en-GB",{hour12:false}),
+                ...r.data,
+              }));
+              latestPatch[d.device_name]=rows[rows.length-1];
+            });
+            if(Object.keys(histPatch).length){
+              setHistoryByDevice(prev=>({...prev,...histPatch}));
+              setLatestByDevice(prev=>({...prev,...latestPatch}));
+            }
+          });
+        }
+      })
+      .catch(console.error);
   },[authState?.valid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Web-client mirror sync ────────────────────────────────────────────────
