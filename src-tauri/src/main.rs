@@ -43,13 +43,10 @@ use tokio_serial::SerialStream;
 
 const MASTER_KEY_HEX:       &str = "d12a45fa8285f9d64a696ec883d0d429c7581d520bd4a92b801ff3c7f953d8ca";
 #[cfg(feature = "cloud_sync")]
-const CLOUD_API_URL: &str = "https://technicloudapi-production.up.railway.app";
-#[cfg(feature = "cloud_sync")]
-const SMTP_HOST: &str = "smtp.gmail.com";
-#[cfg(feature = "cloud_sync")]
-const SMTP_USER: &str = "joesfeir007@gmail.com";
-#[cfg(feature = "cloud_sync")]
-const SMTP_PASS: &str = "bhut umaf dpdw bruo";
+const CLOUD_API_URL: &str = match option_env!("CLOUD_API_URL") {
+    Some(v) => v,
+    None    => "https://technicloudapi-production.up.railway.app",
+};
 const PORT_TIMEOUT_MS:      u64  = 500;
 /// Minimum gap between consecutive Modbus frames on the same RS485 bus (turnaround time).
 const RS485_TURNAROUND_MS:  u64  = 25;
@@ -126,6 +123,7 @@ pub enum PollState { Stopped, Running, Fault }
 pub struct EngineState {
     pub poll:               PollState,
     pub configured_devices: Vec<DeviceConfig>,
+    pub consecutive_faults: HashMap<String, u32>,
 }
 
 pub struct SharedEngine(pub Arc<Mutex<EngineState>>);
@@ -220,6 +218,24 @@ pub struct AuthState {
     /// True when a `machine_api_key` has been obtained from the cloud.
     /// Always false in offline/air-gapped builds.
     pub cloud_registered:  bool,
+}
+
+/// Auth state for online (cloud) builds — stored in the persistent `online_auth` table.
+/// The offline `AuthState` / `settings` table flow is completely separate and unchanged.
+#[cfg(feature = "cloud_sync")]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OnlineAuthState {
+    pub valid:           bool,
+    pub machine_id:      String,
+    pub machine_api_key: String,
+    pub project_id:      i64,
+    pub project_name:    String,
+    pub tier:            u8,
+    pub allowed_meters:  Vec<String>,
+    pub protocols:       String,
+    pub expires_at:      String,
+    pub node_name:       String,
+    pub cloud_url:       String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -400,6 +416,7 @@ fn get_or_create_machine_id(conn: &Connection) -> String {
 }
 
 /// Read `allowed_meters` from the DB without holding the lock long.
+#[cfg(not(feature = "cloud_sync"))]
 fn get_allowed_meters_from_db(db: &Arc<Mutex<Connection>>) -> Vec<String> {
     let conn = db.lock().unwrap();
     conn.query_row("SELECT allowed_meters FROM settings LIMIT 1", [],
@@ -440,11 +457,34 @@ fn sim_register_value(name: &str, idx: usize) -> f64 {
     base + amp * (t * freq * std::f64::consts::TAU + phase).sin()
 }
 
+#[cfg(not(feature = "cloud_sync"))]
 fn is_license_valid(db: &Arc<Mutex<Connection>>) -> bool {
     let conn = db.lock().unwrap();
     let now  = now_secs() as i64;
     conn.query_row("SELECT expiry_date FROM settings LIMIT 1", [], |r| r.get::<_,i64>(0))
         .map(|exp| now < exp).unwrap_or(false)
+}
+
+/// Cloud-build variant: license is valid as long as a row with a non-empty
+/// machine_api_key exists in `online_auth`.
+#[cfg(feature = "cloud_sync")]
+fn is_license_valid_cloud(db: &Arc<Mutex<Connection>>) -> bool {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT machine_api_key FROM online_auth LIMIT 1",
+        [], |r| r.get::<_, String>(0),
+    ).map(|k| !k.is_empty()).unwrap_or(false)
+}
+
+/// Cloud-build variant: reads `allowed_meters` from `online_auth` instead of `settings`.
+#[cfg(feature = "cloud_sync")]
+fn get_allowed_meters_from_cloud(db: &Arc<Mutex<Connection>>) -> Vec<String> {
+    let conn = db.lock().unwrap();
+    conn.query_row("SELECT allowed_meters FROM online_auth LIMIT 1", [],
+        |r| r.get::<_, String>(0))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
 }
 
 // ─── Tauri Commands ── Engine ─────────────────────────────────────────────────
@@ -515,6 +555,8 @@ fn clear_history(db: State<DbConnection>) -> Result<usize, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let n1 = conn.execute("DELETE FROM meter_history", []).map_err(|e| e.to_string())?;
     let n2 = conn.execute("DELETE FROM device_config",  []).map_err(|e| e.to_string())?;
+    // Also clear online auth so the user is returned to ProjectGateway (cloud builds).
+    let _ = conn.execute("DELETE FROM online_auth", []);
     Ok(n1 + n2)
 }
 
@@ -565,6 +607,7 @@ fn get_export_path(db: State<DbConnection>) -> Result<String, String> {
         [], |r| r.get(0),
     ).unwrap_or_default())
 }
+
 
 #[tauri::command]
 fn set_diagnostics_enabled(enabled: bool, diag: State<DiagEnabled>) -> Result<(), String> {
@@ -871,16 +914,287 @@ fn export_to_excel(
     do_export(&conn, &path, target_device.as_deref(), ts_from.as_deref(), None, &username, &project_name)
 }
 
+// ─── Tauri Commands ── Online Auth (cloud builds only) ────────────────────────
+
+/// Activate this machine against the cloud API using project credentials.
+/// Replaces the encrypted-key flow for cloud (online) builds.
+#[cfg(feature = "cloud_sync")]
+#[tauri::command]
+async fn activate_online_project(
+    project_name: String,
+    project_key:  String,
+    node_name:    String,
+    cloud_url:    String,
+    db:           State<'_, DbConnection>,
+) -> Result<OnlineAuthState, String> {
+    let machine_id = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        get_or_create_machine_id(&conn)
+    };
+
+    let client = HttpClient::builder()
+        .timeout(Duration::from_secs(15))
+        .https_only(false)   // allow http for dev/testing
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .post(format!("{cloud_url}/api/machine/activate"))
+        .json(&serde_json::json!({
+            "project_name": project_name,
+            "project_key":  project_key,
+            "node_name":    node_name,
+            "machine_id":   machine_id,
+        }))
+        .send()
+        .await
+        .map_err(|_| "Cannot reach cloud server.".to_string())?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+
+    match status.as_u16() {
+        200 | 201 => {
+            let machine_id      = body["machine_id"]     .as_str().unwrap_or("").to_string();
+            let machine_api_key = body["machine_api_key"].as_str().unwrap_or("").to_string();
+            let project_id      = body["project_id"]     .as_i64().unwrap_or(0);
+            let proj_name       = body["project_name"]   .as_str().unwrap_or(&project_name).to_string();
+            let tier            = body["tier"]            .as_u64().unwrap_or(1) as u8;
+            let expires_at      = body["expires_at"]     .as_str().unwrap_or("").to_string();
+            let protocols       = body["protocols"]      .as_str().unwrap_or("All").to_string();
+            let allowed_meters: Vec<String> = body["allowed_meters"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+            let allowed_meters_json = serde_json::to_string(&allowed_meters).unwrap_or_default();
+
+            {
+                let conn = db.0.lock().map_err(|e| e.to_string())?;
+                conn.execute("DELETE FROM online_auth", []).map_err(|e| e.to_string())?;
+                conn.execute(
+                    "INSERT INTO online_auth (machine_id, machine_api_key, project_id, project_name, tier, allowed_meters, protocols, expires_at, node_name, cloud_url) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![machine_id, machine_api_key, project_id, proj_name, tier as i64,
+                            allowed_meters_json, protocols, expires_at, node_name, cloud_url],
+                ).map_err(|e| e.to_string())?;
+            }
+
+            eprintln!("[online-auth] Activated: project={proj_name} node={node_name} tier={tier}");
+            Ok(OnlineAuthState {
+                valid: true,
+                machine_id,
+                machine_api_key,
+                project_id,
+                project_name: proj_name,
+                tier,
+                allowed_meters,
+                protocols,
+                expires_at,
+                node_name,
+                cloud_url,
+            })
+        }
+        403 => Err("Maximum activations reached for this project.".to_string()),
+        401 | 400 => Err(body["error"].as_str()
+            .or_else(|| body["message"].as_str())
+            .unwrap_or("Invalid project credentials.")
+            .to_string()),
+        other => Err(format!("Server error ({other}).")),
+    }
+}
+
+/// Read the persisted online auth state from SQLite.
+/// Returns `valid: false` if no activation exists yet.
+#[cfg(feature = "cloud_sync")]
+#[tauri::command]
+fn get_online_auth_state(db: State<'_, DbConnection>) -> Result<OnlineAuthState, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let row = conn.query_row(
+        "SELECT machine_id, machine_api_key, project_id, project_name, tier, \
+                allowed_meters, protocols, expires_at, node_name, cloud_url \
+         FROM online_auth LIMIT 1",
+        [],
+        |r| Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, String>(6)?,
+            r.get::<_, String>(7)?,
+            r.get::<_, String>(8)?,
+            r.get::<_, String>(9)?,
+        )),
+    );
+
+    match row {
+        Ok((machine_id, machine_api_key, project_id, project_name, tier,
+            allowed_meters_json, protocols, expires_at, node_name, cloud_url)) => {
+            let allowed_meters: Vec<String> = serde_json::from_str(&allowed_meters_json)
+                .unwrap_or_default();
+            Ok(OnlineAuthState {
+                valid: true,
+                machine_id,
+                machine_api_key,
+                project_id,
+                project_name,
+                tier: tier as u8,
+                allowed_meters,
+                protocols,
+                expires_at,
+                node_name,
+                cloud_url,
+            })
+        }
+        Err(_) => Ok(OnlineAuthState { valid: false, ..Default::default() }),
+    }
+}
+
+/// Verify this machine's activation status with the cloud and optionally receive
+/// updated config.  Returns `active: false` if the project was deactivated.
+/// On network error returns `active: true, offline: true` so the app stays usable.
+#[cfg(feature = "cloud_sync")]
+#[tauri::command]
+async fn check_online_status(db: State<'_, DbConnection>) -> Result<serde_json::Value, String> {
+    let (api_key, cloud_url) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        match conn.query_row(
+            "SELECT machine_api_key, cloud_url FROM online_auth LIMIT 1",
+            [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        ) {
+            Ok(v)  => v,
+            Err(_) => return Ok(serde_json::json!({ "active": false, "reason": "Not activated." })),
+        }
+    };
+
+    let client = HttpClient::builder()
+        .timeout(Duration::from_secs(10))
+        .https_only(false)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let result = client
+        .get(format!("{cloud_url}/api/machine/config"))
+        .header("x-api-key", &api_key)
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) if resp.status().as_u16() == 200 => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+
+            // If the server returned updated project parameters, persist them so
+            // the polling loop and frontend always see the latest values.
+            if let Some(cfg) = body.get("desired_config").filter(|v| v.is_object()) {
+                let new_allowed = cfg.get("allowed_meters")
+                    .and_then(|v| serde_json::to_string(v).ok());
+                let new_protocols = cfg.get("protocols")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let new_tier = cfg.get("tier").and_then(|v| v.as_u64()).map(|t| t as i64);
+
+                let conn = db.0.lock().map_err(|e| e.to_string())?;
+                if let Some(allowed) = new_allowed {
+                    let _ = conn.execute(
+                        "UPDATE online_auth SET allowed_meters = ?1",
+                        params![allowed],
+                    );
+                }
+                if let Some(protocols) = new_protocols {
+                    let _ = conn.execute(
+                        "UPDATE online_auth SET protocols = ?1",
+                        params![protocols],
+                    );
+                }
+                if let Some(tier) = new_tier {
+                    let _ = conn.execute(
+                        "UPDATE online_auth SET tier = ?1",
+                        params![tier],
+                    );
+                }
+                eprintln!("[online-auth] desired_config applied from server.");
+            }
+
+            Ok(serde_json::json!({
+                "active":         true,
+                "config_version": body["config_version"],
+                "desired_config": body["desired_config"],
+            }))
+        }
+        Ok(resp) if resp.status().as_u16() == 401 => {
+            // Project deactivated by admin — clear local auth
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            let _ = conn.execute("DELETE FROM online_auth", []);
+            eprintln!("[online-auth] Project deactivated — cleared local auth.");
+            Ok(serde_json::json!({ "active": false, "reason": "Project deactivated." }))
+        }
+        Ok(resp) => {
+            eprintln!("[online-status] Unexpected HTTP {}", resp.status());
+            Ok(serde_json::json!({ "active": true, "offline": true }))
+        }
+        Err(e) => {
+            eprintln!("[online-status] Network error: {e} — staying online with cached config");
+            Ok(serde_json::json!({ "active": true, "offline": true }))
+        }
+    }
+}
+
+/// Clear the online auth state (logout for cloud builds).
+/// Best-effort PATCH to the cloud to mark the activation inactive; proceeds
+/// with local cleanup regardless of whether the network call succeeds.
+#[cfg(feature = "cloud_sync")]
+#[tauri::command]
+async fn logout_online(db: State<'_, DbConnection>) -> Result<(), String> {
+    // Read credentials before clearing them.
+    let creds: Option<(String, String, String)> = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT machine_id, machine_api_key, cloud_url FROM online_auth LIMIT 1",
+            [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+        ).ok()
+    };
+
+    // Best-effort deactivation — never block logout on network failure.
+    if let Some((machine_id, api_key, cloud_url)) = creds {
+        if let Ok(client) = HttpClient::builder()
+            .timeout(Duration::from_secs(8))
+            .https_only(false)
+            .build()
+        {
+            let _ = client
+                .patch(format!("{cloud_url}/api/machine/deactivate"))
+                .header("x-api-key", &api_key)
+                .json(&serde_json::json!({ "machine_id": machine_id }))
+                .send()
+                .await;
+        }
+    }
+
+    db.0.lock().map_err(|e| e.to_string())?
+       .execute("DELETE FROM online_auth", [])
+       .map_err(|e| e.to_string())?;
+    eprintln!("[online-auth] Logged out — online_auth cleared, history preserved.");
+    Ok(())
+}
+
 // ─── Tauri Commands ── Build Info ─────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct BuildInfo {
     is_cloud_build: bool,
+    cloud_url: String,
 }
 
 #[tauri::command]
 fn get_build_info() -> BuildInfo {
-    BuildInfo { is_cloud_build: cfg!(feature = "cloud_sync") }
+    BuildInfo {
+        is_cloud_build: cfg!(feature = "cloud_sync"),
+        #[cfg(feature = "cloud_sync")]
+        cloud_url: CLOUD_API_URL.to_string(),
+        #[cfg(not(feature = "cloud_sync"))]
+        cloud_url: String::new(),
+    }
 }
 
 // ─── Tauri Commands ── License ────────────────────────────────────────────────
@@ -1200,8 +1514,16 @@ fn get_recent_history(
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .filter_map(|(ts, dn, di, data_str)| {
-            let ts_ms = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S")
-                .ok()?.and_utc().timestamp_millis();
+            // Timestamps are stored as RFC 3339 (e.g. "2026-03-22T14:30:00+05:30").
+            // parse_from_rfc3339 handles the timezone offset; fall back to naive
+            // parse for any legacy rows that were stored without an offset.
+            let ts_ms = chrono::DateTime::parse_from_rfc3339(&ts)
+                .map(|dt| dt.timestamp_millis())
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%dT%H:%M:%S")
+                        .map(|ndt| ndt.and_utc().timestamp_millis())
+                })
+                .ok()?;
             let data: HashMap<String, f64> = serde_json::from_str(&data_str).ok()?;
             Some(HistoryReading { device_name: dn, device_id: di, timestamp_ms: ts_ms, data })
         })
@@ -1275,16 +1597,36 @@ fn modbus_request_hex(slave: u8, address: u16, count: u16) -> String {
     fmt_hex(&frame)
 }
 
+// SMTP is always sent via Resend.  The API key and sender address are baked in
+// at compile time via RESEND_API_KEY / RESEND_FROM_EMAIL env vars.
+// The only runtime config is the destination email stored in app_config.
+
 #[cfg(feature = "cloud_sync")]
-async fn send_alarm_email(dest: &str, device: &str, reg: &str, value: f64, breach: &str) {
-    if SMTP_HOST.is_empty() || SMTP_USER.is_empty() || dest.is_empty() { return; }
-    // Connectivity probe
+async fn send_alarm_email(
+    dest: &str, device: &str, reg: &str, value: f64, breach: &str,
+) {
+    // SMTP settings are hardcoded to Resend.  The API key is embedded at
+    // compile time via RESEND_API_KEY.  Only the destination email is runtime.
+    const SMTP_HOST: &str = "smtp.resend.com";
+    const SMTP_USER: &str = "resend";
+    let smtp_pass  = option_env!("RESEND_API_KEY").unwrap_or("");
+    let from_addr  = option_env!("RESEND_FROM_EMAIL").unwrap_or("info@technicatgroup.com");
+
+    if smtp_pass.is_empty() {
+        eprintln!("[email] RESEND_API_KEY not set at compile time — alarm email skipped");
+        return;
+    }
+    if dest.is_empty() {
+        eprintln!("[email] No destination address configured");
+        return;
+    }
+    // Connectivity probe before attempting auth
     let probe = tokio::time::timeout(
         Duration::from_secs(2),
         TcpStream::connect((SMTP_HOST, 587u16)),
     ).await;
     if matches!(probe, Err(_) | Ok(Err(_))) {
-        eprintln!("[email] Network unreachable — skipping alarm email");
+        eprintln!("[email] Network unreachable on {SMTP_HOST}:587 — skipping alarm email");
         return;
     }
     let subject = format!("TechniDAQ Alarm — {} · {} {}", device, reg, breach);
@@ -1293,17 +1635,19 @@ async fn send_alarm_email(dest: &str, device: &str, reg: &str, value: f64, breac
         device, reg, value, breach
     );
     let email = match Message::builder()
-        .from(SMTP_USER.parse().unwrap())
-        .to(match dest.parse() { Ok(a) => a, Err(e) => { eprintln!("[email] Bad dest addr: {e}"); return; } })
+        .from(match from_addr.parse() { Ok(a) => a, Err(e) => { eprintln!("[email] Bad from addr '{from_addr}': {e}"); return; } })
+        .to(match dest.parse()        { Ok(a) => a, Err(e) => { eprintln!("[email] Bad dest addr '{dest}': {e}"); return; } })
         .subject(subject)
         .header(ContentType::TEXT_PLAIN)
         .body(body) {
             Ok(m) => m,
             Err(e) => { eprintln!("[email] Build error: {e}"); return; }
     };
-    let creds   = Credentials::new(SMTP_USER.to_string(), SMTP_PASS.to_string());
-    let mailer  = match AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(SMTP_HOST) {
-        Ok(b) => b.credentials(creds).build(),
+    let creds = Credentials::new(SMTP_USER.to_string(), smtp_pass.to_string());
+    let mailer = match AsyncSmtpTransport::<Tokio1Executor>::relay(SMTP_HOST)
+        .map(|b| b.credentials(creds).build())
+    {
+        Ok(m)  => m,
         Err(e) => { eprintln!("[email] SMTP build error: {e}"); return; }
     };
     match mailer.send(email).await {
@@ -1313,7 +1657,9 @@ async fn send_alarm_email(dest: &str, device: &str, reg: &str, value: f64, breac
 }
 
 #[cfg(not(feature = "cloud_sync"))]
-async fn send_alarm_email(_dest: &str, _device: &str, _reg: &str, _value: f64, _breach: &str) {
+async fn send_alarm_email(
+    _dest: &str, _device: &str, _reg: &str, _value: f64, _breach: &str,
+) {
     eprintln!("[email] Disabled in Air-Gapped build — recompile with --features cloud_sync to enable.");
 }
 
@@ -1375,7 +1721,11 @@ async fn run_polling_loop(
 
     loop {
         // ── License guard ─────────────────────────────────────────────────
-        if !is_license_valid(&db) {
+        #[cfg(feature = "cloud_sync")]
+        let license_ok = is_license_valid_cloud(&db);
+        #[cfg(not(feature = "cloud_sync"))]
+        let license_ok = is_license_valid(&db);
+        if !license_ok {
             conn_map.clear(); fault_retry.clear();
             sleep(Duration::from_secs(5)).await;
             continue;
@@ -1408,6 +1758,9 @@ async fn run_polling_loop(
         }
 
         // ── Simulation mode ───────────────────────────────────────────────
+        #[cfg(feature = "cloud_sync")]
+        let is_sim = get_allowed_meters_from_cloud(&db).contains(&"Simulation".to_string());
+        #[cfg(not(feature = "cloud_sync"))]
         let is_sim = get_allowed_meters_from_db(&db).contains(&"Simulation".to_string());
         if is_sim {
             conn_map.clear();
@@ -1449,8 +1802,11 @@ async fn run_polling_loop(
                 last_polled.insert(device.device_name.clone(), Instant::now());
 
                 // Alarm check
+                #[cfg(feature = "cloud_sync")]
+                let allowed = get_allowed_meters_from_cloud(&db);
+                #[cfg(not(feature = "cloud_sync"))]
                 let allowed = get_allowed_meters_from_db(&db);
-                if allowed.contains(&"EmailAlerts".to_string()) {
+                if allowed.iter().any(|a| a.eq_ignore_ascii_case("EmailAlerts") || a.eq_ignore_ascii_case("email_alerts")) {
                     let dest_email: String = {
                         let conn = db.lock().unwrap();
                         conn.query_row("SELECT value FROM app_config WHERE key='dest_email'", [], |r| r.get(0))
@@ -1459,9 +1815,11 @@ async fn run_polling_loop(
                     for reg in &device.selected_registers {
                         let val = match data.get(&reg.name) { Some(&v) => v, None => continue };
                         let key = format!("{}::{}", device.device_name, reg.name);
-                        let breach = if let Some(mx) = reg.max_alarm { if val > mx { Some(format!("> max {mx:.2}")) } else { None } }
-                                     else if let Some(mn) = reg.min_alarm { if val < mn { Some(format!("< min {mn:.2}")) } else { None } }
-                                     else { None };
+                        let breach = if reg.max_alarm.map_or(false, |mx| val > mx) {
+                            Some(format!("> max {:.2}", reg.max_alarm.unwrap()))
+                        } else if reg.min_alarm.map_or(false, |mn| val < mn) {
+                            Some(format!("< min {:.2}", reg.min_alarm.unwrap()))
+                        } else { None };
                         match breach {
                             None    => { alarm_consecutive.remove(&key); }
                             Some(b) => {
@@ -1572,10 +1930,50 @@ async fn run_polling_loop(
                     device_name: device.device_name.clone(),
                     device_id,
                     timestamp_ms: ts,
-                    data,
+                    data: data.clone(),
                 });
                 ws_broadcast(&ws_clients, ws_frame);
                 last_polled.insert(device.device_name.clone(), Instant::now());
+
+                // Alarm check (mirrors global sim path)
+                #[cfg(feature = "cloud_sync")]
+                let allowed = get_allowed_meters_from_cloud(&db);
+                #[cfg(not(feature = "cloud_sync"))]
+                let allowed = get_allowed_meters_from_db(&db);
+                if allowed.iter().any(|a| a.eq_ignore_ascii_case("EmailAlerts") || a.eq_ignore_ascii_case("email_alerts")) {
+                    let dest_email: String = {
+                        let conn = db.lock().unwrap();
+                        conn.query_row("SELECT value FROM app_config WHERE key='dest_email'", [], |r| r.get(0))
+                            .unwrap_or_default()
+                    };
+                    for reg in &device.selected_registers {
+                        let val = match data.get(&reg.name) { Some(&v) => v, None => continue };
+                        let key = format!("{}::{}", device.device_name, reg.name);
+                        let breach = if reg.max_alarm.map_or(false, |mx| val > mx) {
+                            Some(format!("> max {:.2}", reg.max_alarm.unwrap()))
+                        } else if reg.min_alarm.map_or(false, |mn| val < mn) {
+                            Some(format!("< min {:.2}", reg.min_alarm.unwrap()))
+                        } else { None };
+                        match breach {
+                            None    => { alarm_consecutive.remove(&key); }
+                            Some(b) => {
+                                let count = alarm_consecutive.entry(key.clone()).or_insert(0);
+                                *count += 1;
+                                if *count >= device.alarm_trigger_cycles {
+                                    let due = email_debounce.get(&key).map_or(true, |t| t.elapsed().as_secs() >= 3600);
+                                    if due {
+                                        email_debounce.insert(key, Instant::now());
+                                        let dest = dest_email.clone();
+                                        let dev  = device.device_name.clone();
+                                        let rn   = reg.name.clone();
+                                        let br   = b.clone();
+                                        tokio::spawn(async move { send_alarm_email(&dest, &dev, &rn, val, &br).await; });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -1602,6 +2000,7 @@ async fn run_polling_loop(
                             timestamp_ms: now_ms(),
                         });
                         fault_retry.insert(conn_key, Instant::now());
+                        { let mut eng = engine.lock().unwrap(); *eng.consecutive_faults.entry(device.device_name.clone()).or_insert(0) += 1; }
                         continue;
                     }
                 }
@@ -1630,6 +2029,7 @@ async fn run_polling_loop(
                     // Other devices on different connections keep running.
                     conn_map.remove(&conn_key);
                     fault_retry.insert(conn_key, Instant::now());
+                    { let mut eng = engine.lock().unwrap(); *eng.consecutive_faults.entry(device.device_name.clone()).or_insert(0) += 1; }
                     // Do NOT break — continue polling other devices
                 }
                 Ok(data) => {
@@ -1660,10 +2060,14 @@ async fn run_polling_loop(
                     });
                     ws_broadcast(&ws_clients, ws_frame);
                     last_polled.insert(device.device_name.clone(), Instant::now());
+                    { let mut eng = engine.lock().unwrap(); eng.consecutive_faults.remove(&device.device_name); }
 
                     // Alarm check
+                    #[cfg(feature = "cloud_sync")]
+                    let allowed = get_allowed_meters_from_cloud(&db);
+                    #[cfg(not(feature = "cloud_sync"))]
                     let allowed = get_allowed_meters_from_db(&db);
-                    if allowed.contains(&"EmailAlerts".to_string()) {
+                    if allowed.iter().any(|a| a.eq_ignore_ascii_case("EmailAlerts") || a.eq_ignore_ascii_case("email_alerts")) {
                         let dest_email: String = {
                             let conn = db.lock().unwrap();
                             conn.query_row("SELECT value FROM app_config WHERE key='dest_email'", [], |r| r.get(0))
@@ -1672,9 +2076,11 @@ async fn run_polling_loop(
                         for reg in &device.selected_registers {
                             let val = match data.get(&reg.name) { Some(&v) => v, None => continue };
                             let key = format!("{}::{}", device.device_name, reg.name);
-                            let breach = if let Some(mx) = reg.max_alarm { if val > mx { Some(format!("> max {mx:.2}")) } else { None } }
-                                         else if let Some(mn) = reg.min_alarm { if val < mn { Some(format!("< min {mn:.2}")) } else { None } }
-                                         else { None };
+                            let breach = if reg.max_alarm.map_or(false, |mx| val > mx) {
+                                Some(format!("> max {:.2}", reg.max_alarm.unwrap()))
+                            } else if reg.min_alarm.map_or(false, |mn| val < mn) {
+                                Some(format!("< min {:.2}", reg.min_alarm.unwrap()))
+                            } else { None };
                             match breach {
                                 None    => { alarm_consecutive.remove(&key); }
                                 Some(b) => {
@@ -1853,33 +2259,65 @@ async fn run_nightly_loop(db: Arc<Mutex<Connection>>, db_path: Arc<PathBuf>) {
 // ─── Store & Forward Sync Loop ────────────────────────────────────────────────
 //
 // Ticks every 5 seconds.  On each tick:
-//   1. Read (mode, machine_api_key) from settings — skip if not online/registered.
+//   1. Read machine_api_key + cloud_url from online_auth — skip if not activated.
 //   2. SELECT up to 500 unsynced rows from meter_history.
-//   3. POST the batch to [CLOUD_API_URL]/api/machine/ingest.
+//   3. POST the batch to {cloud_url}/api/machine/ingest with x-api-key header.
 //   4. On HTTP 200: mark rows synced = 1.
 //   5. Prune rows that are already synced AND older than 48 hours.
 //
 // This function is compiled ONLY in cloud builds (--features cloud_sync).
 
 #[cfg(feature = "cloud_sync")]
-async fn run_cloud_sync_loop(db: Arc<Mutex<Connection>>, client: HttpClient) {
+async fn run_cloud_sync_loop(
+    db:           Arc<Mutex<Connection>>,
+    client:       HttpClient,
+    app:          tauri::AppHandle,
+    engine:       Arc<Mutex<EngineState>>,
+    profiles_map: Arc<Mutex<HashMap<String, MeterProfileEntry>>>,
+    db_path:      Arc<PathBuf>,
+) {
+    let mut check_tick:     u32    = 0; // incremented each 5-s iteration; config check every 12 (60 s)
+    let mut config_rejected:  bool   = false;
+    let mut rejection_reason: String = String::new();
+    let mut rollback_watch: Option<(Vec<DeviceConfig>, u32)> = None;
+
     loop {
         sleep(Duration::from_secs(5)).await;
+        check_tick = check_tick.wrapping_add(1);
 
-        // ── Read license state (cheap, brief lock) ─────────────────────────
-        let (mode, api_key) = {
+        // ── Read online auth state (cheap, brief lock) ────────────────────
+        let (api_key, ingest_url) = {
             let conn = db.lock().unwrap();
             match conn.query_row(
-                "SELECT mode, machine_api_key FROM settings LIMIT 1",
+                "SELECT machine_api_key, cloud_url FROM online_auth LIMIT 1",
                 [],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             ) {
                 Ok(v)  => v,
-                Err(_) => continue, // no license active yet
+                Err(_) => continue, // not activated yet
             }
         };
 
-        if mode != "online" || api_key.is_empty() { continue; }
+        if api_key.is_empty() { continue; }
+
+        // ── Periodic project-status check (every 60 s) ────────────────────
+        if check_tick % 12 == 0 {
+            match client
+                .get(format!("{ingest_url}/api/machine/config"))
+                .header("x-api-key", &api_key)
+                .send()
+                .await
+            {
+                Ok(r) if r.status().as_u16() == 401 => {
+                    eprintln!("[sync] Project deactivated by admin — clearing local auth.");
+                    { let conn = db.lock().unwrap(); let _ = conn.execute("DELETE FROM online_auth", []); }
+                    let _ = app.emit("project-deactivated",
+                        serde_json::json!({ "reason": "Project has been deactivated by admin." }));
+                    continue;
+                }
+                _ => {} // 200 or network error — stay online
+            }
+        }
 
         // ── 48-hour pruning of already-synced rows ─────────────────────────
         // Uses our ISO timestamp format for correct string comparison.
@@ -1915,6 +2353,35 @@ async fn run_cloud_sync_loop(db: Arc<Mutex<Connection>>, client: HttpClient) {
 
         if rows.is_empty() { continue; }
 
+        // ── Rollback watch ─────────────────────────────────────────────────
+        if let Some((ref old_cfg, ref mut ticks)) = rollback_watch {
+            *ticks += 1;
+            let fault_triggered = {
+                let eng = engine.lock().unwrap();
+                eng.configured_devices.iter().any(|d| {
+                    eng.consecutive_faults.get(&d.device_name).copied().unwrap_or(0) >= 5
+                })
+            };
+            if fault_triggered || *ticks > 20 {
+                if fault_triggered {
+                    let old_json = serde_json::to_string(old_cfg).unwrap_or_default();
+                    { let conn = db.lock().unwrap(); let _ = conn.execute(
+                        "INSERT OR REPLACE INTO device_config (id, config_json) VALUES (1, ?1)",
+                        params![old_json],
+                    ); }
+                    { let mut eng = engine.lock().unwrap();
+                      eng.configured_devices = old_cfg.clone();
+                      eng.consecutive_faults.clear(); }
+                    let _ = app.emit("config-rollback",
+                        serde_json::json!({ "reason": "5 consecutive failures" }));
+                    config_rejected  = true;
+                    rejection_reason = "5 consecutive failures after remote config apply".to_string();
+                    eprintln!("[sync] Config rolled back due to consecutive poll failures");
+                }
+                rollback_watch = None;
+            }
+        }
+
         let ids: Vec<i64>              = rows.iter().map(|(id, ..)| *id).collect();
         let readings: Vec<serde_json::Value> = rows.iter().map(|(_id, ts, dn, _di, data)| {
             // Parse the stored JSON string back into a Value so the API receives
@@ -1928,22 +2395,138 @@ async fn run_cloud_sync_loop(db: Arc<Mutex<Connection>>, client: HttpClient) {
             })
         }).collect();
 
+        // ── Read current active device names + alarm thresholds ───────────
+        let (active_devices, thresholds) = {
+            let conn = db.lock().unwrap();
+            let json: String = conn.query_row(
+                "SELECT config_json FROM device_config WHERE id = 1", [], |r| r.get(0),
+            ).unwrap_or_else(|_| "[]".to_string());
+            let devices_val = serde_json::from_str::<Vec<serde_json::Value>>(&json)
+                .unwrap_or_default();
+
+            let names: Vec<String> = devices_val.iter()
+                .filter_map(|d| d["device_name"].as_str().map(|s| s.to_string()))
+                .collect();
+
+            let mut thresh_map = serde_json::Map::new();
+            for device in &devices_val {
+                let dev_name = match device["device_name"].as_str() { Some(n) => n, None => continue };
+                let regs = match device["selected_registers"].as_array() { Some(r) => r, None => continue };
+                let mut reg_map = serde_json::Map::new();
+                for reg in regs {
+                    let reg_name = match reg["name"].as_str() { Some(n) => n, None => continue };
+                    let min = reg["min_alarm"].as_f64();
+                    let max = reg["max_alarm"].as_f64();
+                    if min.is_some() || max.is_some() {
+                        reg_map.insert(reg_name.to_string(), serde_json::json!({
+                            "min": min,
+                            "max": max,
+                        }));
+                    }
+                }
+                if !reg_map.is_empty() {
+                    thresh_map.insert(dev_name.to_string(), serde_json::Value::Object(reg_map));
+                }
+            }
+            (names, serde_json::Value::Object(thresh_map))
+        };
+
+        // ── Read current poll state ────────────────────────────────────────
+        let poll_state_str = {
+            let eng = engine.lock().unwrap();
+            match eng.poll {
+                PollState::Running => "running",
+                PollState::Stopped => "stopped",
+                PollState::Fault   => "fault",
+            }.to_string()
+        };
+
         // ── POST batch to cloud ────────────────────────────────────────────
         let result = client
-            .post(format!("{CLOUD_API_URL}/api/machine/ingest"))
+            .post(format!("{ingest_url}/api/machine/ingest"))
             .header("x-api-key", &api_key)
-            .json(&serde_json::json!({ "telemetry_array": readings }))
+            .json(&serde_json::json!({
+                "telemetry_array":  readings,
+                "active_devices":   active_devices,
+                "thresholds":       thresholds,
+                "polling_state":    poll_state_str,
+                "config_rejected":  config_rejected,
+                "rejection_reason": if config_rejected { rejection_reason.clone() } else { String::new() },
+            }))
             .send()
             .await;
+
+        config_rejected  = false;
+        rejection_reason = String::new();
 
         match result {
             Ok(resp) if resp.status().is_success() => {
                 // Mark all rows in the batch as synced using safe integer list
                 let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
                 let sql     = format!("UPDATE meter_history SET synced = 1 WHERE id IN ({id_list})");
-                let conn    = db.lock().unwrap();
-                let _       = conn.execute(&sql, []);
+                { let conn = db.lock().unwrap(); let _ = conn.execute(&sql, []); }
                 eprintln!("[sync] ✔ {} row(s) synced to cloud", ids.len());
+
+                // ── Parse response body for admin flags ───────────────────
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+
+                // ── config_update ─────────────────────────────────────────
+                if body.get("config_update").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if let Some(desired) = body.get("desired_config") {
+                        if let Ok(new_devices) = serde_json::from_value::<Vec<DeviceConfig>>(desired.clone()) {
+                            // Snapshot old config for potential rollback
+                            let old_config: Vec<DeviceConfig> = {
+                                let conn = db.lock().unwrap();
+                                let json: String = conn.query_row(
+                                    "SELECT config_json FROM device_config WHERE id = 1", [], |r| r.get(0),
+                                ).unwrap_or_else(|_| "[]".to_string());
+                                serde_json::from_str(&json).unwrap_or_default()
+                            };
+                            // Write new config to DB
+                            let new_json = serde_json::to_string(&new_devices).unwrap_or_default();
+                            { let conn = db.lock().unwrap(); let _ = conn.execute(
+                                "INSERT OR REPLACE INTO device_config (id, config_json) VALUES (1, ?1)",
+                                params![new_json],
+                            ); }
+                            // Update SharedEngine in memory
+                            { let mut eng = engine.lock().unwrap();
+                              eng.configured_devices = new_devices.clone();
+                              eng.consecutive_faults.clear(); }
+                            // Emit frontend event
+                            let config_version = body.get("config_version")
+                                .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let _ = app.emit("config-updated",
+                                serde_json::json!({ "source": "remote", "config_version": config_version }));
+                            // Start 20-tick rollback watch window
+                            rollback_watch = Some((old_config, 0));
+                            eprintln!("[sync] Remote config applied (version: {config_version})");
+                        }
+                    }
+                }
+
+                // ── profiles_update ───────────────────────────────────────
+                if body.get("profiles_update").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if let Some(profiles_val) = body.get("meter_profiles") {
+                        if let Ok(new_profiles) = serde_json::from_value::<HashMap<String, MeterProfileEntry>>(profiles_val.clone()) {
+                            let count = new_profiles.len();
+                            // Overwrite in-memory profile library
+                            { *profiles_map.lock().unwrap() = new_profiles.clone(); }
+                            // Write cache file next to DB for offline startup
+                            let cache_path = db_path.parent().unwrap_or(&db_path).join("profiles_cloud.json");
+                            if let Ok(s) = serde_json::to_string_pretty(&new_profiles) {
+                                let _ = std::fs::write(&cache_path, s);
+                            }
+                            let _ = app.emit("profiles-updated", serde_json::json!({}));
+                            eprintln!("[sync] Remote profiles applied ({count} entries)");
+                        }
+                    }
+                }
+            }
+            Ok(resp) if resp.status().as_u16() == 401 => {
+                eprintln!("[sync] Project deactivated (ingest 401) — clearing local auth.");
+                { let conn = db.lock().unwrap(); let _ = conn.execute("DELETE FROM online_auth", []); }
+                let _ = app.emit("project-deactivated",
+                    serde_json::json!({ "reason": "Project has been deactivated by admin." }));
             }
             Ok(resp) => {
                 eprintln!("[sync] ✗ HTTP {} — will retry next tick", resp.status());
@@ -1989,6 +2572,21 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
             tier             INTEGER NOT NULL DEFAULT 1,
             protocols        TEXT    NOT NULL DEFAULT 'All',
             machine_api_key  TEXT    NOT NULL DEFAULT ''
+        );
+
+        -- Persistent online auth state for cloud builds (never dropped — survives restarts).
+        CREATE TABLE IF NOT EXISTS online_auth (
+            id              INTEGER PRIMARY KEY,
+            machine_id      TEXT    NOT NULL DEFAULT '',
+            machine_api_key TEXT    NOT NULL DEFAULT '',
+            project_id      INTEGER NOT NULL DEFAULT 0,
+            project_name    TEXT    NOT NULL DEFAULT '',
+            tier            INTEGER NOT NULL DEFAULT 1,
+            allowed_meters  TEXT    NOT NULL DEFAULT '[]',
+            protocols       TEXT    NOT NULL DEFAULT 'All',
+            expires_at      TEXT    NOT NULL DEFAULT '',
+            node_name       TEXT    NOT NULL DEFAULT '',
+            cloud_url       TEXT    NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS app_config (
@@ -2058,7 +2656,14 @@ async fn api_dispatch(
 
         // ── Build info ────────────────────────────────────────────────────────
         "get_build_info" => {
-            ok(serde_json::json!({ "is_cloud_build": cfg!(feature = "cloud_sync") }))
+            #[cfg(feature = "cloud_sync")]
+            let cloud_url = CLOUD_API_URL;
+            #[cfg(not(feature = "cloud_sync"))]
+            let cloud_url = "";
+            ok(serde_json::json!({
+                "is_cloud_build": cfg!(feature = "cloud_sync"),
+                "cloud_url": cloud_url,
+            }))
         }
 
         // ── Auth ──────────────────────────────────────────────────────────────
@@ -2487,7 +3092,7 @@ async fn web_handler(uri: Uri) -> Response {
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -2518,6 +3123,7 @@ fn main() {
             let engine = Arc::new(Mutex::new(EngineState {
                 poll:               PollState::Stopped,
                 configured_devices: vec![],
+                consecutive_faults: HashMap::new(),
             }));
 
             app.manage(DbConnection(Arc::clone(&db)));
@@ -2592,6 +3198,10 @@ fn main() {
                     .https_only(true)
                     .build()
                     .expect("reqwest client build failed"),
+                app.handle().clone(),
+                Arc::clone(&engine),
+                Arc::clone(&profiles_map),
+                Arc::clone(&db_path_arc),
             ));
 
             // ── Intranet Web Server (Axum) ────────────────────────────────────
@@ -2620,15 +3230,32 @@ fn main() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            get_build_info,
-            toggle_polling, get_status, clear_history, get_record_count, export_to_excel,
-            activate_license, get_auth_state, logout_user,
-            get_meter_profiles, reload_profiles, apply_bus_config, get_saved_bus_config, get_recent_history,
-            save_notification_email, get_notification_email,
-            set_diagnostics_enabled,
-            save_export_path, get_export_path,
-        ])
+        ;
+
+    #[cfg(feature = "cloud_sync")]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        get_build_info,
+        toggle_polling, get_status, clear_history, get_record_count, export_to_excel,
+        activate_license, get_auth_state, logout_user,
+        activate_online_project, get_online_auth_state, check_online_status, logout_online,
+        get_meter_profiles, reload_profiles, apply_bus_config, get_saved_bus_config, get_recent_history,
+        save_notification_email, get_notification_email,
+        set_diagnostics_enabled,
+        save_export_path, get_export_path,
+    ]);
+
+    #[cfg(not(feature = "cloud_sync"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        get_build_info,
+        toggle_polling, get_status, clear_history, get_record_count, export_to_excel,
+        activate_license, get_auth_state, logout_user,
+        get_meter_profiles, reload_profiles, apply_bus_config, get_saved_bus_config, get_recent_history,
+        save_notification_email, get_notification_email,
+        set_diagnostics_enabled,
+        save_export_path, get_export_path,
+    ]);
+
+    builder
         .build(tauri::generate_context!())
         .expect("tauri build failed")
         .run(|app, event| {

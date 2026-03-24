@@ -45,7 +45,20 @@ interface AuthState {
   cloud_registered?:  boolean;
 }
 interface DiagEvent   { direction: string; hex: string; device_name: string; timestamp_ms: number; }
-interface BuildInfo   { is_cloud_build: boolean; }
+interface BuildInfo   { is_cloud_build: boolean; cloud_url: string; }
+interface OnlineAuthState {
+  valid:           boolean;
+  machine_id:      string;
+  machine_api_key: string;
+  project_id:      number;
+  project_name:    string;
+  tier:            number;
+  allowed_meters:  string[];
+  protocols:       string;
+  expires_at:      string;
+  node_name:       string;
+  cloud_url:       string;
+}
 
 type PollState    = "running" | "stopped" | "fault";
 type Theme        = "dark"   | "light";
@@ -161,8 +174,8 @@ function MetricCard({ name, value, idx, isDark, sparkData, minAlarm, maxAlarm }:
        : abs>=1   ? value!.toFixed(2) : value!.toFixed(4))
     : "——";
 
-  const isOverMax  = maxAlarm !== undefined && hasVal && value! > maxAlarm;
-  const isUnderMin = minAlarm !== undefined && hasVal && value! < minAlarm;
+  const isOverMax  = maxAlarm != null && hasVal && value! > maxAlarm;
+  const isUnderMin = minAlarm != null && hasVal && value! < minAlarm;
   const alarmColor = isOverMax ? CLR.red : isUnderMin ? CLR.amber : undefined;
 
   return (
@@ -495,18 +508,12 @@ function WaveformChart({ history, chartKeys, pollState, tabAccent, isDark }:{
                   tick={{ fontFamily:"'Share Tech Mono',monospace", fontSize:10, fill:axisTick }}
                   axisLine={{ stroke:CLR.border(isDark) }} tickLine={false}
                   interval="preserveStartEnd" minTickGap={60}/>
-                {chartKeys.slice(0,1).map(()=>(
-                  <YAxis key="l" yAxisId="l" orientation="left"
-                    tick={{ fontFamily:"'Share Tech Mono',monospace", fontSize:10, fill:LINE_COLORS[0] }}
+                {chartKeys.length > 0 && (
+                  <YAxis yAxisId="l" orientation="left"
+                    tick={{ fontFamily:"'Share Tech Mono',monospace", fontSize:10, fill:axisTick }}
                     axisLine={false} tickLine={false} width={56}
                     tickFormatter={(v:number)=>v.toFixed(1)}/>
-                ))}
-                {chartKeys.slice(1,2).map(()=>(
-                  <YAxis key="r" yAxisId="r" orientation="right"
-                    tick={{ fontFamily:"'Share Tech Mono',monospace", fontSize:10, fill:LINE_COLORS[1] }}
-                    axisLine={false} tickLine={false} width={56}
-                    tickFormatter={(v:number)=>v.toFixed(2)}/>
-                ))}
+                )}
                 <Tooltip contentStyle={{
                   background:   isDark?"#1c2128":"#ffffff",
                   border:       `1px solid ${CLR.border(isDark)}`,
@@ -517,7 +524,7 @@ function WaveformChart({ history, chartKeys, pollState, tabAccent, isDark }:{
                 }} cursor={{ stroke:CLR.borderDim(isDark), strokeWidth:1, strokeDasharray:"4 4" }}/>
                 <Legend wrapperStyle={{ display:"none" }}/>
                 {chartKeys.filter(k=>visibleKeys.has(k)).map((k,i)=>(
-                  <Line key={k} yAxisId={i===0?"l":"r"} type="monotone" dataKey={k}
+                  <Line key={k} yAxisId="l" type="monotone" dataKey={k}
                     stroke={LINE_COLORS[i%LINE_COLORS.length]} strokeWidth={2}
                     dot={false} activeDot={{ r:4, fill:LINE_COLORS[i%LINE_COLORS.length] }}
                     isAnimationActive={false}/>
@@ -799,6 +806,7 @@ function AppHeader({
   username, projectName, onLogout, configuredDevices, activeDeviceName,
   isSimulation, onOpenTerminal, hasDiagnostics,
   licenseMode, licenseTier, isCloudBuild, cloudRegistered,
+  onlineAuthState, onlineOffline,
 }:{
   pollState:PollState; lastPollMs:number; theme:Theme;
   onThemeToggle:()=>void; onTogglePoll:()=>void;
@@ -808,6 +816,7 @@ function AppHeader({
   isSimulation:boolean; onOpenTerminal: ()=>void; hasDiagnostics: boolean;
   licenseMode?: "offline" | "online"; licenseTier?: 1 | 2 | 3;
   isCloudBuild: boolean; cloudRegistered?: boolean;
+  onlineAuthState?: OnlineAuthState|null; onlineOffline?: boolean;
 }) {
   const isDark    = theme === "dark";
   const isRunning = pollState === "running";
@@ -850,14 +859,16 @@ function AppHeader({
             letterSpacing:"0.06em",color:"#e6edf3",lineHeight:1 }}>TechniDAQ</div>
           <div style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.5rem",
             letterSpacing:"0.14em",color:CLR.text3(isDark),lineHeight:1.5 }}>
-            {username ? `${username} · ${projectName||"Technicat Group"}` : (projectName||"by Technicat Group")}
+            {isCloudBuild && onlineAuthState?.valid
+              ? `${onlineAuthState.node_name} · ${onlineAuthState.project_name}`
+              : username ? `${username} · ${projectName||"Technicat Group"}` : (projectName||"by Technicat Group")}
           </div>
         </div>
       </div>
 
       {/* Edition / license badge — hard-branched on build type */}
       {!isCloudBuild ? (
-        // Air-gapped binary: static label baked at compile time, never dynamic
+        // Air-gapped binary: static label baked at compile time
         <div style={{
           flexShrink:0, display:"flex", alignItems:"center",
           padding:"3px 9px", borderRadius:"4px",
@@ -869,8 +880,39 @@ function AppHeader({
         }}>
           AIR-GAPPED EDITION
         </div>
+      ) : onlineOffline ? (
+        // Cloud binary — no network, running on cached config
+        <div style={{
+          flexShrink:0, display:"flex", alignItems:"center",
+          padding:"3px 9px", borderRadius:"4px",
+          border:`1px solid ${CLR.amber}60`,
+          background:`${CLR.amber}18`,
+          fontFamily:"'Share Tech Mono',monospace", fontSize:"0.48rem",
+          letterSpacing:"0.14em", textTransform:"uppercase",
+          color:CLR.amber, gap:"5px", whiteSpace:"nowrap",
+        }}>
+          <span>&#9679; OFFLINE</span>
+          <span style={{ opacity:0.5 }}>·</span>
+          <span>USING CACHED CONFIG</span>
+        </div>
+      ) : onlineAuthState?.valid ? (
+        // Cloud binary — active online auth
+        <div style={{
+          flexShrink:0, display:"flex", alignItems:"center",
+          padding:"3px 9px", borderRadius:"4px",
+          border:`1px solid ${CLR.blue}60`,
+          background:`${CLR.blue}18`,
+          fontFamily:"'Share Tech Mono',monospace", fontSize:"0.48rem",
+          letterSpacing:"0.14em", textTransform:"uppercase",
+          color:CLR.blue, gap:"5px", whiteSpace:"nowrap",
+        }}>
+          <span style={{ color:CLR.green }}>&#9679;</span>
+          <span>ONLINE</span>
+          <span style={{ opacity:0.5 }}>·</span>
+          <span>TIER {onlineAuthState.tier}</span>
+        </div>
       ) : licenseMode ? (
-        // Cloud binary: dynamic mode/tier badge from decrypted license payload
+        // Cloud binary — legacy encrypted-key license (offline/online mode)
         <div style={{
           flexShrink:0, display:"flex", alignItems:"center",
           padding:"3px 9px", borderRadius:"4px",
@@ -1541,12 +1583,13 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme,license
   );
   const [notifEmail,   setNotifEmail]   = useState("");
   const [emailSaved,   setEmailSaved]   = useState(false);
+  const [emailError,   setEmailError]   = useState<string|null>(null);
   const [exportDir,    setExportDir]    = useState("");
   const [dirSaved,     setDirSaved]     = useState(false);
   const [fieldErrors,  setFieldErrors]  = useState<Record<number,Set<string>>>({});
 
   useEffect(()=>{
-    invokeApi<string>("get_notification_email").then(setNotifEmail).catch(()=>{});
+    invokeApi<string>("get_notification_email").then(v=>{setNotifEmail(v);if(v)setEmailSaved(true);}).catch(console.error);
     invokeApi<string>("get_export_path").then(setExportDir).catch(()=>{});
   },[]);
 
@@ -1650,16 +1693,17 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme,license
               Alarm Notifications (requires EmailAlerts license)
             </div>
             <div style={{ padding:"12px 14px", display:"flex", flexDirection:"column", gap:"10px" }}>
-              {/* Destination email */}
+              {/* Destination email — alerts are sent FROM the Resend account */}
               <div style={{ display:"flex", gap:"8px", alignItems:"center" }}>
-                <input type="email" value={notifEmail} placeholder="destination@email.com"
-                  onChange={e=>{setNotifEmail(e.target.value);setEmailSaved(false);}}
+                <input type="email" value={notifEmail} placeholder="Send alerts to: you@email.com"
+                  onChange={e=>{setNotifEmail(e.target.value);setEmailSaved(false);setEmailError(null);}}
                   style={{ ...iS, flex:1 }}/>
                 <button onClick={async ()=>{
                   try {
                     await invokeApi("save_notification_email", { email: notifEmail });
                     setEmailSaved(true);
-                  } catch {}
+                    setEmailError(null);
+                  } catch(e) { setEmailError(String(e)); }
                 }} style={{
                   height:"32px", padding:"0 14px", borderRadius:"5px",
                   background: emailSaved ? CLR.green+"20" : CLR.blue+"20",
@@ -1669,6 +1713,8 @@ function DeviceSetupModal({ profiles,initialDevices,onSave,onClose,theme,license
                   fontWeight:700, fontSize:"0.72rem", whiteSpace:"nowrap",
                 }}>{emailSaved ? "Saved ✓" : "Save Email"}</button>
               </div>
+              {emailError && <div style={{ color: CLR.red, fontSize:"0.72rem", fontFamily:"'Rajdhani',sans-serif" }}>{emailError}</div>}
+
             </div>
           </div>
 
@@ -1954,6 +2000,193 @@ function LicenseGateway({ onActivated }:{ onActivated:(auth:AuthState)=>void }) 
   );
 }
 
+// ─── ProjectGateway (cloud builds only) ──────────────────────────────────────
+
+function ProjectGateway({
+  cloudUrl, onActivated, message,
+}:{
+  cloudUrl: string;
+  onActivated: (state: OnlineAuthState) => void;
+  message?: string;
+}) {
+  const [projectName, setProjectName] = useState("");
+  const [projectKey,  setProjectKey]  = useState("");
+  const [nodeName,    setNodeName]    = useState("");
+  const [error,       setError]       = useState<string|null>(null);
+  const [busy,        setBusy]        = useState(false);
+  const [focused,     setFocused]     = useState<string|null>(null);
+  const [pendingPayload, setPendingPayload] = useState<{projectName:string;projectKey:string;nodeName:string}|null>(null);
+  const [existingCount,  setExistingCount]  = useState(0);
+
+  const iS = (f:string): React.CSSProperties => ({
+    width:"100%", padding:"10px 12px",
+    background:"rgba(255,255,255,0.06)",
+    border:`1px solid ${focused===f?"rgba(29,107,255,0.7)":"rgba(255,255,255,0.12)"}`,
+    borderRadius:"7px", color:"#e6edf3", outline:"none",
+    fontFamily:"'Rajdhani',sans-serif",
+    fontSize:"0.92rem", fontWeight:600, letterSpacing:"0.04em",
+    boxShadow:focused===f?"0 0 0 3px rgba(29,107,255,0.18)":"none",
+    transition:"all 0.2s ease",
+  });
+
+  const doActivate = async (payload:{projectName:string;projectKey:string;nodeName:string}, clearHistory:boolean) => {
+    setBusy(true);
+    setPendingPayload(null);
+    try {
+      if(clearHistory) await invokeApi("clear_history");
+      const result = await invokeApi<OnlineAuthState>("activate_online_project", {
+        projectName: payload.projectName,
+        projectKey:  payload.projectKey,
+        nodeName:    payload.nodeName,
+        cloudUrl,
+      });
+      onActivated(result);
+    } catch(e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const activate = async () => {
+    setError(null);
+    if(!projectName.trim()){ setError("Project Name is required."); return; }
+    if(!projectKey.trim())  { setError("Project Key is required.");  return; }
+    setBusy(true);
+    try {
+      const payload = { projectName: projectName.trim(), projectKey: projectKey.trim(), nodeName: nodeName.trim() || "this-node" };
+      const count = await invokeApi<number>("get_record_count");
+      if(count > 0){
+        setPendingPayload(payload);
+        setExistingCount(count);
+        setBusy(false);
+        return;
+      }
+      await doActivate(payload, false);
+    } catch(e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{
+      position:"fixed", inset:0, background:"#0f1117",
+      backgroundImage:"radial-gradient(circle,rgba(30,36,48,0.9) 1px,transparent 1px)",
+      backgroundSize:"24px 24px",
+      display:"flex", alignItems:"center", justifyContent:"center", zIndex:9999,
+    }}>
+      <div style={{
+        width:"100%", maxWidth:440,
+        background:"#161b22", border:"1px solid #30363d",
+        borderRadius:"12px", boxShadow:"0 24px 80px rgba(0,0,0,0.8)", overflow:"hidden",
+      }}>
+        <div style={{ height:"3px", background:"linear-gradient(90deg,#1d6bff,#16a34a,#d97706)" }}/>
+        <div style={{ padding:"32px" }}>
+          <div style={{ textAlign:"center", marginBottom:"28px" }}>
+            <img src={logoUrl} alt="Technicat Group"
+              style={{ width:200, height:"auto", display:"block", margin:"0 auto 12px" }}/>
+            <div style={{ fontFamily:"'Rajdhani',sans-serif", fontWeight:700, fontSize:"1.4rem",
+              letterSpacing:"0.06em", color:"#e6edf3" }}>TechniDAQ</div>
+            <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.52rem",
+              letterSpacing:"0.2em", color:"#484f58", marginTop:"3px" }}>
+              PROJECT ACTIVATION
+            </div>
+          </div>
+          {message && (
+            <div style={{ padding:"10px 12px", marginBottom:"16px",
+              background:"rgba(245,158,11,0.1)", border:"1px solid rgba(245,158,11,0.3)",
+              borderRadius:"7px", fontFamily:"'Share Tech Mono',monospace",
+              fontSize:"0.64rem", color:"#fbbf24", letterSpacing:"0.04em", lineHeight:1.5 }}>
+              ⚠ {message}
+            </div>
+          )}
+          <div style={{ display:"flex", flexDirection:"column", gap:"14px" }}>
+            <div>
+              <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.5rem",
+                letterSpacing:"0.2em", color:"#484f58", textTransform:"uppercase", marginBottom:"6px" }}>
+                Project Name
+              </div>
+              <input type="text" placeholder="e.g. Site Alpha"
+                style={iS("pname")} value={projectName}
+                onChange={e=>{setProjectName(e.target.value);setError(null);}}
+                onFocus={()=>setFocused("pname")} onBlur={()=>setFocused(null)}
+                onKeyDown={e=>{if(e.key==="Enter")activate();}}/>
+            </div>
+            <div>
+              <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.5rem",
+                letterSpacing:"0.2em", color:"#484f58", textTransform:"uppercase", marginBottom:"6px" }}>
+                Project Key
+              </div>
+              <input type="password" placeholder="Paste your project key…"
+                style={iS("pkey")} value={projectKey}
+                onChange={e=>{setProjectKey(e.target.value);setError(null);}}
+                onFocus={()=>setFocused("pkey")} onBlur={()=>setFocused(null)}
+                onKeyDown={e=>{if(e.key==="Enter")activate();}}/>
+            </div>
+            <div>
+              <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.5rem",
+                letterSpacing:"0.2em", color:"#484f58", textTransform:"uppercase", marginBottom:"6px" }}>
+                Node Name <span style={{ opacity:0.45, textTransform:"none", letterSpacing:0 }}>(optional)</span>
+              </div>
+              <input type="text" placeholder="e.g. panel-01 (defaults to this-node)"
+                style={iS("nname")} value={nodeName}
+                onChange={e=>{setNodeName(e.target.value);setError(null);}}
+                onFocus={()=>setFocused("nname")} onBlur={()=>setFocused(null)}
+                onKeyDown={e=>{if(e.key==="Enter")activate();}}/>
+            </div>
+            {error && (
+              <div style={{ padding:"10px 12px",
+                background:"rgba(220,38,38,0.1)", border:"1px solid rgba(220,38,38,0.3)",
+                borderRadius:"7px", fontFamily:"'Share Tech Mono',monospace",
+                fontSize:"0.64rem", color:"#f87171", letterSpacing:"0.04em", lineHeight:1.5 }}>
+                ⚠ {error}
+              </div>
+            )}
+            {pendingPayload ? (
+              <div style={{ padding:"12px",
+                background:"rgba(245,158,11,0.08)", border:"1px solid rgba(245,158,11,0.35)",
+                borderRadius:"7px", display:"flex", flexDirection:"column", gap:"10px" }}>
+                <div style={{ fontFamily:"'Share Tech Mono',monospace", fontSize:"0.62rem",
+                  color:"#fbbf24", letterSpacing:"0.04em", lineHeight:1.5 }}>
+                  {existingCount.toLocaleString()} records from a previous session exist in the database.
+                  Keep the existing data or clear it before activating?
+                </div>
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"8px" }}>
+                  <button onClick={()=>doActivate(pendingPayload,false)} disabled={busy} style={{
+                    padding:"9px", background:"rgba(34,197,94,0.12)",
+                    border:"1px solid rgba(34,197,94,0.4)", borderRadius:"6px",
+                    color:"#4ade80", fontFamily:"'Rajdhani',sans-serif", fontWeight:700,
+                    fontSize:"0.78rem", letterSpacing:"0.1em", cursor:busy?"not-allowed":"pointer",
+                  }}>Keep Data</button>
+                  <button onClick={()=>doActivate(pendingPayload,true)} disabled={busy} style={{
+                    padding:"9px", background:"rgba(239,68,68,0.12)",
+                    border:"1px solid rgba(239,68,68,0.4)", borderRadius:"6px",
+                    color:"#f87171", fontFamily:"'Rajdhani',sans-serif", fontWeight:700,
+                    fontSize:"0.78rem", letterSpacing:"0.1em", cursor:busy?"not-allowed":"pointer",
+                  }}>Clear &amp; Start Fresh</button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={activate} disabled={busy} style={{
+                padding:"11px",
+                background:busy?"rgba(29,107,255,0.15)":"#1d6bff",
+                border:`1px solid ${busy?"rgba(29,107,255,0.3)":"#1d6bff"}`,
+                borderRadius:"7px",
+                color:busy?"#484f58":"#fff",
+                fontFamily:"'Rajdhani',sans-serif", fontWeight:700,
+                fontSize:"0.85rem", letterSpacing:"0.14em", textTransform:"uppercase",
+                cursor:busy?"not-allowed":"pointer",
+                boxShadow:busy?"none":"0 4px 18px rgba(29,107,255,0.4)",
+              }}>{busy?"Connecting…":"Activate Project"}</button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── LogoutModal ──────────────────────────────────────────────────────────────
 
 function LogoutModal({ username, projectName, onConfirm, onClose, theme, busy }:{
@@ -2181,6 +2414,10 @@ export default function App() {
   const [diagLines,         setDiagLines]          = useState<DiagLine[]>([]);
   // Default false — safe offline assumption until backend confirms cloud build.
   const [isCloudBuild,      setIsCloudBuild]       = useState(false);
+  const [cloudUrl,          setCloudUrl]           = useState("");
+  const [onlineAuthState,   setOnlineAuthState]    = useState<OnlineAuthState|null>(null);
+  const [onlineOffline,     setOnlineOffline]      = useState(false);
+  const [gatewayMessage,    setGatewayMessage]     = useState<string|undefined>(undefined);
 
   const toastRef  = useRef<ReturnType<typeof setTimeout>|null>(null);
   const exportRef = useRef<ReturnType<typeof setTimeout>|null>(null);
@@ -2198,21 +2435,71 @@ export default function App() {
     toastRef.current=setTimeout(()=>setToast(t=>({...t,visible:false})),4000);
   },[]);
 
-  // ── Build type + Auth (parallel on startup) ───────────────────────────────
+  // ── Build type + Auth on startup ──────────────────────────────────────────
   useEffect(()=>{
     invokeApi<BuildInfo>("get_build_info")
-      .then(b => setIsCloudBuild(b.is_cloud_build))
-      .catch(() => setIsCloudBuild(false)); // fail-safe: treat unknown as air-gapped
-    invokeApi<AuthState>("get_auth_state")
-      .then(a=>{setAuthState(a);setCheckingAuth(false);})
-      .catch(()=>{setAuthState({valid:false,allowed_meters:[]});setCheckingAuth(false);});
+      .then(b=>{
+        setIsCloudBuild(b.is_cloud_build);
+        setCloudUrl(b.cloud_url ?? "");
+        if(b.is_cloud_build){
+          // Online path: check persisted auth, then verify with server
+          invokeApi<OnlineAuthState>("get_online_auth_state")
+            .then(oas=>{
+              if(oas.valid){
+                invokeApi<{
+                  active: boolean;
+                  offline?: boolean;
+                  reason?: string;
+                  config_version?: number;
+                  desired_config?: { allowed_meters?: string[]; protocols?: string; tier?: number };
+                }>("check_online_status")
+                  .then(status=>{
+                    if(status.active){
+                      // Re-fetch from SQLite so we pick up any desired_config the
+                      // backend just wrote (updated allowed_meters / tier / protocols).
+                      invokeApi<OnlineAuthState>("get_online_auth_state")
+                        .then(fresh=>setOnlineAuthState(fresh))
+                        .catch(()=>setOnlineAuthState(oas)); // fallback to cached
+                      if(status.offline) setOnlineOffline(true);
+                    } else {
+                      setOnlineAuthState({...oas, valid:false});
+                      setGatewayMessage(status.reason ?? "Project deactivated.");
+                    }
+                  })
+                  .catch(()=>{
+                    // Network error — stay online with cached config
+                    setOnlineAuthState(oas);
+                    setOnlineOffline(true);
+                  })
+                  .finally(()=>setCheckingAuth(false));
+              } else {
+                setOnlineAuthState(oas); // valid:false → show ProjectGateway
+                setCheckingAuth(false);
+              }
+            })
+            .catch(()=>setCheckingAuth(false));
+        } else {
+          // Offline path — existing flow unchanged
+          invokeApi<AuthState>("get_auth_state")
+            .then(a=>{setAuthState(a);setCheckingAuth(false);})
+            .catch(()=>{setAuthState({valid:false,allowed_meters:[]});setCheckingAuth(false);});
+        }
+      })
+      .catch(()=>{
+        // get_build_info failed — safe fallback to offline flow
+        invokeApi<AuthState>("get_auth_state")
+          .then(a=>{setAuthState(a);setCheckingAuth(false);})
+          .catch(()=>{setAuthState({valid:false,allowed_meters:[]});setCheckingAuth(false);});
+      });
   },[]);
 
   useEffect(()=>{
-    if(!authState?.valid)return;
+    const valid   = isCloudBuild ? onlineAuthState?.valid : authState?.valid;
+    const meters  = isCloudBuild ? (onlineAuthState?.allowed_meters ?? []) : (authState?.allowed_meters ?? []);
+    if(!valid)return;
     invokeApi<PollState>("get_status").then(setPollState).catch(console.error);
-    if(authState.allowed_meters.length>0){
-      invokeApi<MeterProfile[]>("get_meter_profiles",{allowedMeters:authState.allowed_meters})
+    if(meters.length>0){
+      invokeApi<MeterProfile[]>("get_meter_profiles",{allowedMeters:meters})
         .then(setProfiles)
         .catch(e=>showToast(`Failed to load profiles: ${e}`,"error"));
     }
@@ -2248,13 +2535,14 @@ export default function App() {
         }
       })
       .catch(console.error);
-  },[authState?.valid]); // eslint-disable-line react-hooks/exhaustive-deps
+  },[authState?.valid, onlineAuthState?.valid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Web-client mirror sync ────────────────────────────────────────────────
   // When running in a browser (phone/tablet), pull a snapshot of the current
   // desktop state and then keep it live via WebSocket.
   useEffect(()=>{
-    if(isTauri || !authState?.valid) return;
+    const activeValid = isCloudBuild ? onlineAuthState?.valid : authState?.valid;
+    if(isTauri || !activeValid) return;
 
     const base = `http://${window.location.hostname}:3030`;
 
@@ -2314,11 +2602,12 @@ export default function App() {
     ws.onerror = (e)=> console.warn("[mirror] WebSocket error:", e);
 
     return ()=>{ ws.close(); };
-  },[isTauri, authState?.valid]); // eslint-disable-line react-hooks/exhaustive-deps
+  },[isTauri, authState?.valid, onlineAuthState?.valid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Events ────────────────────────────────────────────────────────────────
   useEffect(()=>{
-    if(!authState?.valid)return;
+    const valid = isCloudBuild ? onlineAuthState?.valid : authState?.valid;
+    if(!valid)return;
     const subs:Promise<UnlistenFn>[]=[];
 
     subs.push(listenApi<MeterReading>("meter-data",e=>{
@@ -2338,6 +2627,10 @@ export default function App() {
     subs.push(listenApi<StatusEvent>("status-changed",e=>setPollState(e.payload.state)));
     subs.push(listenApi<FaultEvent>("meter-fault",e=>
       showToast(`⚠ ${e.payload.device_name}: ${e.payload.reason}`,"warn")));
+    subs.push(listenApi<{reason:string}>("project-deactivated",e=>{
+      setOnlineAuthState(s=>s?{...s,valid:false}:null);
+      setGatewayMessage(e.payload.reason);
+    }));
     subs.push(listenApi<DiagEvent>("diag-frame", e=>{
       const p = e.payload;
       setDiagLines(prev=>{
@@ -2346,9 +2639,29 @@ export default function App() {
         return next.length > 500 ? next.slice(-500) : next;
       });
     }));
+    subs.push(listenApi<{source:string;config_version:string}>("config-updated", async ()=>{
+      const devices = await invokeApi<DeviceConfig[]>("get_saved_bus_config").catch(()=>[] as DeviceConfig[]);
+      if(devices.length>0) setConfiguredDevices(devices);
+      showToast("Configuration updated remotely by administrator","success");
+    }));
+    subs.push(listenApi<{reason:string}>("config-rollback", async ()=>{
+      const devices = await invokeApi<DeviceConfig[]>("get_saved_bus_config").catch(()=>[] as DeviceConfig[]);
+      if(devices.length>0) setConfiguredDevices(devices);
+      showToast("Remote configuration failed \u2014 rolled back to previous config","warn");
+    }));
+    subs.push(listenApi("profiles-updated", async ()=>{
+      const meters = isCloudBuild
+        ? (onlineAuthState?.allowed_meters ?? [])
+        : (authState?.allowed_meters ?? []);
+      if(meters.length>0){
+        const updated = await invokeApi<MeterProfile[]>("get_meter_profiles",{allowedMeters:meters}).catch(()=>[] as MeterProfile[]);
+        if(updated.length>0) setProfiles(updated);
+      }
+      showToast("Meter profiles updated by administrator","success");
+    }));
 
     return ()=>{subs.forEach(p=>p.then(fn=>fn()));};
-  },[authState?.valid,showToast]);
+  },[isCloudBuild,authState?.valid,onlineAuthState?.valid,showToast]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Save bus config ───────────────────────────────────────────────────────
   const handleSaveBusConfig = useCallback(async (devices:DeviceConfig[])=>{
@@ -2412,8 +2725,8 @@ export default function App() {
         path:              fp,
         targetDevice:      target ?? null,
         timeRangeSeconds:  timeRange ?? null,
-        username:          authState?.username  ?? "",
-        projectName:       authState?.project_name ?? "",
+        username:          isCloudBuild ? (onlineAuthState?.node_name ?? "") : (authState?.username ?? ""),
+        projectName:       isCloudBuild ? (onlineAuthState?.project_name ?? "") : (authState?.project_name ?? ""),
       });
       setExportStatus("success");
       showToast(`Exported ${n.toLocaleString()} records${target?` — ${target}`:""}`, "success");
@@ -2431,9 +2744,14 @@ export default function App() {
   const handleLogout = useCallback(async ()=>{
     setLogoutBusy(true);
     try {
-      await invokeApi("logout_user");
+      if(isCloudBuild){
+        await invokeApi("logout_online");
+        setOnlineAuthState(prev => prev ? {...prev, valid:false} : null);
+      } else {
+        await invokeApi("logout_user");
+        setAuthState({valid:false, allowed_meters:[]});
+      }
       // Reset all runtime state — history intentionally preserved in DB
-      setAuthState({valid:false, allowed_meters:[]});
       setConfiguredDevices([]);
       setProfiles([]);
       setLatestByDevice({});
@@ -2446,23 +2764,30 @@ export default function App() {
     } finally {
       setLogoutBusy(false);
     }
-  },[showToast]);
+  },[isCloudBuild, showToast]);
+
+  // ── Derive active meters list (works for both auth paths) ─────────────────
+  const activeMeters: string[] = isCloudBuild
+    ? (onlineAuthState?.allowed_meters ?? [])
+    : (authState?.allowed_meters ?? []);
 
   // ── Simulation flag ───────────────────────────────────────────────────────
-  const isSimulation = authState?.allowed_meters.includes("Simulation") ?? false;
+  const isSimulation = activeMeters.includes("Simulation");
 
   // ── Diagnostics flag ──────────────────────────────────────────────────────
-  const hasDiagnostics = authState?.allowed_meters.includes("Diagnostics") ?? false;
+  const hasDiagnostics = activeMeters.includes("Diagnostics");
 
   // ── Cloud / advanced telemetry flag ───────────────────────────────────────
-  // Requires online mode AND tier 2 or higher.
-  const isCloudEnabled = authState?.mode === "online" && (authState?.tier ?? 1) >= 2;
+  const isCloudEnabled = isCloudBuild
+    ? true  // cloud builds are always cloud-enabled
+    : (authState?.mode === "online" && (authState?.tier ?? 1) >= 2);
 
   // ── Enable/disable diagnostics when terminal is toggled ───────────────────
   useEffect(()=>{
-    if (!authState?.valid) return;
+    const valid = isCloudBuild ? onlineAuthState?.valid : authState?.valid;
+    if (!valid) return;
     invokeApi("set_diagnostics_enabled", { enabled: showTerminal }).catch(console.error);
-  }, [showTerminal, authState?.valid]);
+  }, [showTerminal, authState?.valid, onlineAuthState?.valid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Active tab device ─────────────────────────────────────────────────────
   const activeDevice = configuredDevices.find(d=>d.device_name===activeTab);
@@ -2472,21 +2797,25 @@ export default function App() {
   const activeLatest  = activeTab ? (latestByDevice[activeTab]?.data??{}) : {};
   const activeHistory = activeTab ? (historyByDevice[activeTab]??[])        : [];
 
-  // Chart keys: pick 1 voltage + 1 power from active tab's registers
+  // Chart keys: all selected registers for the active tab
   const chartKeys = useMemo(()=>{
     if(!activeDevice)return [];
-    const names = activeDevice.selected_registers.map(r=>r.name);
-    const vk = names.find(n=>n.toLowerCase().includes("voltage l-l avg"))
-            ?? names.find(n=>n.toLowerCase().includes("voltage l-n"))
-            ?? names.find(n=>n.toLowerCase().includes("voltage"));
-    const pk = names.find(n=>n.toLowerCase().includes("active power total"))
-            ?? names.find(n=>n.toLowerCase().includes("active power"));
-    return ([vk,pk].filter(Boolean) as string[]).slice(0,2);
+    return activeDevice.selected_registers.map(r=>r.name);
   },[activeDevice]);
 
   // ── Guards ────────────────────────────────────────────────────────────────
-  if (checkingAuth)      return <AuthLoadingScreen/>;
-  if (!authState?.valid) return <LicenseGateway onActivated={setAuthState}/>;
+  if (checkingAuth) return <AuthLoadingScreen/>;
+  if (isCloudBuild) {
+    if (!onlineAuthState?.valid) return (
+      <ProjectGateway
+        cloudUrl={cloudUrl}
+        onActivated={state=>{setOnlineAuthState(state);setGatewayMessage(undefined);setOnlineOffline(false);}}
+        message={gatewayMessage}
+      />
+    );
+  } else {
+    if (!authState?.valid) return <LicenseGateway onActivated={setAuthState}/>;
+  }
 
   return (
     <div className="tdaq-page" style={{
@@ -2501,7 +2830,7 @@ export default function App() {
           onSave={handleSaveBusConfig}
           onClose={()=>setShowModal(false)}
           theme={theme}
-          licensedProtocols={authState?.protocols}
+          licensedProtocols={isCloudBuild ? (onlineAuthState?.protocols as "RTU"|"TCP"|"All"|undefined) : authState?.protocols}
           isCloudEnabled={isCloudEnabled}
           isCloudBuild={isCloudBuild}
         />
@@ -2509,8 +2838,8 @@ export default function App() {
 
       {showLogout && (
         <LogoutModal
-          username={authState?.username??""}
-          projectName={authState?.project_name??""}
+          username={isCloudBuild ? (onlineAuthState?.node_name??"") : (authState?.username??"")}
+          projectName={isCloudBuild ? (onlineAuthState?.project_name??"") : (authState?.project_name??"")}
           onConfirm={handleLogout}
           onClose={()=>setShowLogout(false)}
           theme={theme}
@@ -2535,6 +2864,8 @@ export default function App() {
         licenseTier={authState?.tier}
         isCloudBuild={isCloudBuild}
         cloudRegistered={authState?.cloud_registered}
+        onlineAuthState={onlineAuthState}
+        onlineOffline={onlineOffline}
       />
 
       <BusBar
