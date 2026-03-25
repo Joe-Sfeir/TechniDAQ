@@ -1085,11 +1085,10 @@ function AppHeader({
 
 // ─── BusBar ───────────────────────────────────────────────────────────────────
 
-function BusBar({ configuredDevices, pollState, onOpenModal, isDark }:{
-  configuredDevices:DeviceConfig[]; pollState:PollState;
+function BusBar({ configuredDevices, onOpenModal, isDark }:{
+  configuredDevices:DeviceConfig[];
   onOpenModal:()=>void; isDark:boolean;
 }) {
-  const isPolling = pollState==="running"||pollState==="fault";
   return (
     <div style={{
       display:"flex",alignItems:"center",gap:"10px",
@@ -1098,16 +1097,16 @@ function BusBar({ configuredDevices, pollState, onOpenModal, isDark }:{
       borderBottom:`1px solid ${CLR.border(isDark)}`,
       backdropFilter:"blur(12px)", WebkitBackdropFilter:"blur(12px)",
     }}>
-      <button onClick={onOpenModal} disabled={isPolling} style={{
+      <button onClick={onOpenModal} style={{
         display:"flex",alignItems:"center",gap:"6px",
         padding:"0 12px",height:"26px",
-        background:isPolling?"transparent":CLR.blue+"18",
-        border:`1px solid ${isPolling?CLR.borderDim(isDark):CLR.blue+"50"}`,
+        background:CLR.blue+"18",
+        border:`1px solid ${CLR.blue+"50"}`,
         borderRadius:"5px",
-        color:isPolling?CLR.text3(isDark):CLR.blue,
+        color:CLR.blue,
         fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
         fontSize:"0.7rem",letterSpacing:"0.1em",textTransform:"uppercase",
-        cursor:isPolling?"not-allowed":"pointer",opacity:isPolling?0.45:1,
+        cursor:"pointer",opacity:1,
       }}>
         <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth={2.5}>
           <circle cx="12" cy="12" r="3"/>
@@ -1115,13 +1114,7 @@ function BusBar({ configuredDevices, pollState, onOpenModal, isDark }:{
         </svg>
         Configure Bus
       </button>
-      {isPolling && (
-        <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.54rem",
-          letterSpacing:"0.12em",color:CLR.text3(isDark) }}>
-          Stop polling to reconfigure
-        </span>
-      )}
-      {configuredDevices.length>0 && !isPolling && (
+      {configuredDevices.length>0 && (
         <>
           <span style={{ color:CLR.border(isDark),fontSize:"0.8rem" }}>|</span>
           {configuredDevices.map((d,i)=>(
@@ -2659,6 +2652,11 @@ export default function App() {
       }
       showToast("Meter profiles updated by administrator","success");
     }));
+    subs.push(listenApi("project-settings-updated", async ()=>{
+      const fresh = await invokeApi<OnlineAuthState>("get_online_auth_state").catch(()=>null);
+      if(fresh) setOnlineAuthState(fresh);
+      showToast("Project settings updated by administrator","success");
+    }));
 
     return ()=>{subs.forEach(p=>p.then(fn=>fn()));};
   },[isCloudBuild,authState?.valid,onlineAuthState?.valid,showToast]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -2870,7 +2868,6 @@ export default function App() {
 
       <BusBar
         configuredDevices={configuredDevices}
-        pollState={pollState}
         onOpenModal={()=>setShowModal(true)}
         isDark={isDark}
       />

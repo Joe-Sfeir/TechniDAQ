@@ -490,10 +490,11 @@ fn get_allowed_meters_from_cloud(db: &Arc<Mutex<Connection>>) -> Vec<String> {
 // ─── Tauri Commands ── Engine ─────────────────────────────────────────────────
 
 #[tauri::command]
-fn toggle_polling(
-    engine:     State<SharedEngine>,
+async fn toggle_polling(
+    engine:     State<'_, SharedEngine>,
+    db:         State<'_, DbConnection>,
     app_handle: tauri::AppHandle,
-    ws:         State<WsClients>,
+    ws:         State<'_, WsClients>,
 ) -> Result<PollState, String> {
     let new_state = {
         let mut e = engine.0.lock().map_err(|e| e.to_string())?;
@@ -503,6 +504,43 @@ fn toggle_polling(
     app_handle.emit("status-changed", StatusEvent { state: new_state.clone() })
         .map_err(|e| e.to_string())?;
     ws_broadcast(&ws.0, build_state_msg(&engine.0));
+
+    // ── Cloud build: instantly notify the cloud of the new polling state ──
+    #[cfg(feature = "cloud_sync")]
+    {
+        let creds: Option<(String, String)> = {
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            conn.query_row(
+                "SELECT machine_api_key, cloud_url FROM online_auth LIMIT 1",
+                [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            ).ok()
+        };
+        if let Some((api_key, cloud_url)) = creds {
+            if !api_key.is_empty() {
+                let state_str = match new_state {
+                    PollState::Running => "running",
+                    PollState::Stopped => "stopped",
+                    PollState::Fault   => "fault",
+                }.to_string();
+                tokio::spawn(async move {
+                    if let Ok(client) = HttpClient::builder()
+                        .timeout(Duration::from_secs(5))
+                        .https_only(false)
+                        .build()
+                    {
+                        let _ = client
+                            .post(format!("{cloud_url}/api/machine/status"))
+                            .header("x-api-key", &api_key)
+                            .json(&serde_json::json!({ "polling_state": state_str }))
+                            .send()
+                            .await;
+                        eprintln!("[toggle] ✔ Polling state '{}' sent to cloud", state_str);
+                    }
+                });
+            }
+        }
+    }
+
     Ok(new_state)
 }
 
@@ -2519,6 +2557,34 @@ async fn run_cloud_sync_loop(
                             let _ = app.emit("profiles-updated", serde_json::json!({}));
                             eprintln!("[sync] Remote profiles applied ({count} entries)");
                         }
+                    }
+                }
+
+                // ── project_settings_update ───────────────────────────────
+                if body.get("project_settings_update").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if let Some(settings) = body.get("project_settings") {
+                        let new_allowed   = settings.get("allowed_meters")
+                            .and_then(|v| serde_json::to_string(v).ok());
+                        let new_protocols = settings.get("protocols")
+                            .and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let new_tier      = settings.get("tier")
+                            .and_then(|v| v.as_u64()).map(|t| t as i64);
+                        let conn = db.lock().unwrap();
+                        if let Some(allowed) = new_allowed {
+                            let _ = conn.execute(
+                                "UPDATE online_auth SET allowed_meters = ?1", params![allowed]);
+                        }
+                        if let Some(protocols) = new_protocols {
+                            let _ = conn.execute(
+                                "UPDATE online_auth SET protocols = ?1", params![protocols]);
+                        }
+                        if let Some(tier) = new_tier {
+                            let _ = conn.execute(
+                                "UPDATE online_auth SET tier = ?1", params![tier]);
+                        }
+                        drop(conn);
+                        let _ = app.emit("project-settings-updated", serde_json::json!({}));
+                        eprintln!("[sync] Project settings updated from ingest response");
                     }
                 }
             }
