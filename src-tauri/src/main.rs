@@ -295,6 +295,79 @@ fn load_profiles_from_disk() -> HashMap<String, MeterProfileEntry> {
     HashMap::new()
 }
 
+/// Fetch meter profiles from the cloud API and update the in-memory library.
+/// Also writes a local cache file (profiles_cloud.json) for offline fallback.
+/// Returns `true` if the cloud fetch succeeded and profiles were applied.
+#[cfg(feature = "cloud_sync")]
+async fn fetch_and_cache_cloud_profiles(
+    client:      &HttpClient,
+    api_key:     &str,
+    cloud_url:   &str,
+    cache_path:  &std::path::Path,
+    profiles_st: &Arc<Mutex<HashMap<String, MeterProfileEntry>>>,
+) -> bool {
+    let resp = match client
+        .get(format!("{cloud_url}/api/meter-profiles"))
+        .header("x-api-key", api_key)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r)  => { eprintln!("[profiles] Cloud fetch returned HTTP {}", r.status()); return false; }
+        Err(e) => { eprintln!("[profiles] Cloud fetch error: {e}"); return false; }
+    };
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v)  => v,
+        Err(e) => { eprintln!("[profiles] Cloud profiles parse error: {e}"); return false; }
+    };
+
+    // The endpoint may return either a map or an array; handle both.
+    let map: HashMap<String, MeterProfileEntry> = if body.is_object() {
+        match serde_json::from_value(body) {
+            Ok(m)  => m,
+            Err(e) => { eprintln!("[profiles] Cloud profiles deserialize error: {e}"); return false; }
+        }
+    } else if let Some(arr) = body.as_array() {
+        let mut m = HashMap::new();
+        for v in arr {
+            if let Ok(entry) = serde_json::from_value::<MeterProfileEntry>(v.clone()) {
+                m.insert(entry.model.clone(), entry);
+            }
+        }
+        if m.is_empty() { return false; }
+        m
+    } else {
+        eprintln!("[profiles] Cloud profiles: unexpected response shape");
+        return false;
+    };
+
+    let count = map.len();
+    *profiles_st.lock().unwrap() = map.clone();
+    if let Ok(s) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(cache_path, s);
+    }
+    eprintln!("[profiles] Cloud profiles applied ({count} entries), cached to {}", cache_path.display());
+    true
+}
+
+/// Load profiles_cloud.json from the given directory and apply to in-memory state.
+/// Used as the offline fallback when the cloud fetch fails on startup.
+#[cfg(feature = "cloud_sync")]
+fn apply_cached_cloud_profiles(
+    cache_path:  &std::path::Path,
+    profiles_st: &Arc<Mutex<HashMap<String, MeterProfileEntry>>>,
+) {
+    if let Ok(s) = std::fs::read_to_string(cache_path) {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, MeterProfileEntry>>(&s) {
+            let count = map.len();
+            *profiles_st.lock().unwrap() = map;
+            eprintln!("[profiles] Loaded {count} profiles from cloud cache (offline fallback)");
+        }
+    }
+}
+
 /// Returns the "Custom" device — always injected regardless of license.
 fn custom_profile() -> MeterProfileEntry {
     MeterProfileEntry {
@@ -595,6 +668,8 @@ fn clear_history(db: State<DbConnection>) -> Result<usize, String> {
     let n2 = conn.execute("DELETE FROM device_config",  []).map_err(|e| e.to_string())?;
     // Also clear online auth so the user is returned to ProjectGateway (cloud builds).
     let _ = conn.execute("DELETE FROM online_auth", []);
+    // Clear all user preferences (notification email, export path, etc.) for a true fresh start.
+    let _ = conn.execute("DELETE FROM app_config", []);
     Ok(n1 + n2)
 }
 
@@ -959,11 +1034,12 @@ fn export_to_excel(
 #[cfg(feature = "cloud_sync")]
 #[tauri::command]
 async fn activate_online_project(
-    project_name: String,
-    project_key:  String,
-    node_name:    String,
-    cloud_url:    String,
-    db:           State<'_, DbConnection>,
+    project_name:   String,
+    project_key:    String,
+    node_name:      String,
+    cloud_url:      String,
+    db:             State<'_, DbConnection>,
+    profiles_state: State<'_, ProfilesState>,
 ) -> Result<OnlineAuthState, String> {
     let machine_id = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -1018,6 +1094,21 @@ async fn activate_online_project(
             }
 
             eprintln!("[online-auth] Activated: project={proj_name} node={node_name} tier={tier}");
+
+            // ── Fetch meter profiles from cloud after activation ───────────────
+            let cache_path = {
+                let conn = db.0.lock().map_err(|e| e.to_string())?;
+                conn.path()
+                    .map(|p| PathBuf::from(p).parent().unwrap_or(std::path::Path::new(".")).join("profiles_cloud.json"))
+                    .unwrap_or_else(|| PathBuf::from("profiles_cloud.json"))
+            };
+            let fetched = fetch_and_cache_cloud_profiles(
+                &client, &machine_api_key, &cloud_url, &cache_path, &profiles_state.0,
+            ).await;
+            if !fetched {
+                apply_cached_cloud_profiles(&cache_path, &profiles_state.0);
+            }
+
             Ok(OnlineAuthState {
                 valid: true,
                 machine_id,
@@ -1094,14 +1185,22 @@ fn get_online_auth_state(db: State<'_, DbConnection>) -> Result<OnlineAuthState,
 /// On network error returns `active: true, offline: true` so the app stays usable.
 #[cfg(feature = "cloud_sync")]
 #[tauri::command]
-async fn check_online_status(db: State<'_, DbConnection>) -> Result<serde_json::Value, String> {
-    let (api_key, cloud_url) = {
+async fn check_online_status(
+    db:             State<'_, DbConnection>,
+    profiles_state: State<'_, ProfilesState>,
+) -> Result<serde_json::Value, String> {
+    let (api_key, cloud_url, cache_path) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         match conn.query_row(
             "SELECT machine_api_key, cloud_url FROM online_auth LIMIT 1",
             [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         ) {
-            Ok(v)  => v,
+            Ok((k, u)) => {
+                let cp = conn.path()
+                    .map(|p| PathBuf::from(p).parent().unwrap_or(std::path::Path::new(".")).join("profiles_cloud.json"))
+                    .unwrap_or_else(|| PathBuf::from("profiles_cloud.json"));
+                (k, u, cp)
+            }
             Err(_) => return Ok(serde_json::json!({ "active": false, "reason": "Not activated." })),
         }
     };
@@ -1154,6 +1253,14 @@ async fn check_online_status(db: State<'_, DbConnection>) -> Result<serde_json::
                 eprintln!("[online-auth] desired_config applied from server.");
             }
 
+            // ── Fetch meter profiles from cloud on startup ─────────────────────
+            let fetched = fetch_and_cache_cloud_profiles(
+                &client, &api_key, &cloud_url, &cache_path, &profiles_state.0,
+            ).await;
+            if !fetched {
+                apply_cached_cloud_profiles(&cache_path, &profiles_state.0);
+            }
+
             Ok(serde_json::json!({
                 "active":         true,
                 "config_version": body["config_version"],
@@ -1169,10 +1276,13 @@ async fn check_online_status(db: State<'_, DbConnection>) -> Result<serde_json::
         }
         Ok(resp) => {
             eprintln!("[online-status] Unexpected HTTP {}", resp.status());
+            // Network reachable but unexpected status — try offline cache
+            apply_cached_cloud_profiles(&cache_path, &profiles_state.0);
             Ok(serde_json::json!({ "active": true, "offline": true }))
         }
         Err(e) => {
             eprintln!("[online-status] Network error: {e} — staying online with cached config");
+            apply_cached_cloud_profiles(&cache_path, &profiles_state.0);
             Ok(serde_json::json!({ "active": true, "offline": true }))
         }
     }
@@ -2434,7 +2544,7 @@ async fn run_cloud_sync_loop(
         }).collect();
 
         // ── Read current active device names + alarm thresholds ───────────
-        let (active_devices, thresholds) = {
+        let (active_devices, thresholds, current_config) = {
             let conn = db.lock().unwrap();
             let json: String = conn.query_row(
                 "SELECT config_json FROM device_config WHERE id = 1", [], |r| r.get(0),
@@ -2466,7 +2576,9 @@ async fn run_cloud_sync_loop(
                     thresh_map.insert(dev_name.to_string(), serde_json::Value::Object(reg_map));
                 }
             }
-            (names, serde_json::Value::Object(thresh_map))
+            let cfg_val: serde_json::Value = serde_json::from_str(&json)
+                .unwrap_or(serde_json::Value::Array(vec![]));
+            (names, serde_json::Value::Object(thresh_map), cfg_val)
         };
 
         // ── Read current poll state ────────────────────────────────────────
@@ -2487,6 +2599,7 @@ async fn run_cloud_sync_loop(
                 "telemetry_array":  readings,
                 "active_devices":   active_devices,
                 "thresholds":       thresholds,
+                "current_config":   current_config,
                 "polling_state":    poll_state_str,
                 "config_rejected":  config_rejected,
                 "rejection_reason": if config_rejected { rejection_reason.clone() } else { String::new() },
