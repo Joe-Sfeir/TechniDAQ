@@ -62,9 +62,9 @@ pub struct RegisterEntry {
     pub length:     u16,
     pub data_type:  String,   // "Float32" | "UInt16" | "UInt32" | "INT16" | "INT32"
     pub multiplier: f64,
-    #[serde(default)]
+    #[serde(default, alias = "alarm_min")]
     pub min_alarm: Option<f64>,
-    #[serde(default)]
+    #[serde(default, alias = "alarm_max")]
     pub max_alarm: Option<f64>,
 }
 
@@ -86,6 +86,7 @@ pub struct DeviceConfig {
     pub meter_model:        String,
     pub slave_id:           u8,
     pub poll_rate_ms:       u64,
+    #[serde(alias = "registers")]
     pub selected_registers: Vec<RegisterEntry>,
     #[serde(default = "default_trigger_cycles")]
     pub alarm_trigger_cycles: u32,
@@ -307,7 +308,7 @@ async fn fetch_and_cache_cloud_profiles(
     profiles_st: &Arc<Mutex<HashMap<String, MeterProfileEntry>>>,
 ) -> bool {
     let resp = match client
-        .get(format!("{cloud_url}/api/meter-profiles"))
+        .get(format!("{cloud_url}/api/machine/meter-profiles"))
         .header("x-api-key", api_key)
         .timeout(Duration::from_secs(10))
         .send()
@@ -1821,11 +1822,13 @@ async fn try_connect(
         Protocol::Rtu => {
             let parity = {
                 let lib = profiles.lock().unwrap();
-                lib.get(&device.meter_model).map(|p| match p.parity.as_str() {
-                    "Even" => tokio_serial::Parity::Even,
-                    "Odd"  => tokio_serial::Parity::Odd,
-                    _      => tokio_serial::Parity::None,
-                }).unwrap_or(tokio_serial::Parity::None)
+                let norm = normalize_meter_name(&device.meter_model);
+                lib.values().find(|p| normalize_meter_name(&p.model) == norm)
+                    .map(|p| match p.parity.as_str() {
+                        "Even" => tokio_serial::Parity::Even,
+                        "Odd"  => tokio_serial::Parity::Odd,
+                        _      => tokio_serial::Parity::None,
+                    }).unwrap_or(tokio_serial::Parity::None)
             };
             let builder = tokio_serial::new(&device.com_port, device.baud_rate)
                 .parity(parity)
@@ -2161,8 +2164,10 @@ async fn run_polling_loop(
             // Look up endianness for this device model
             let endian = {
                 let lib = profiles.lock().unwrap();
-                lib.get(&device.meter_model).map(|p| p.endianness.clone())
-                   .unwrap_or_else(|| "ABCD".into())
+                let norm = normalize_meter_name(&device.meter_model);
+                lib.values().find(|p| normalize_meter_name(&p.model) == norm)
+                    .map(|p| p.endianness.clone())
+                    .unwrap_or_else(|| "ABCD".into())
             };
 
             match poll_device_registers(ctx, &device.selected_registers, &endian).await {
@@ -2424,10 +2429,11 @@ async fn run_cloud_sync_loop(
     profiles_map: Arc<Mutex<HashMap<String, MeterProfileEntry>>>,
     db_path:      Arc<PathBuf>,
 ) {
-    let mut check_tick:     u32    = 0; // incremented each 5-s iteration; config check every 12 (60 s)
-    let mut config_rejected:  bool   = false;
-    let mut rejection_reason: String = String::new();
-    let mut rollback_watch: Option<(Vec<DeviceConfig>, u32)> = None;
+    let mut check_tick:          u32    = 0; // incremented each 5-s iteration; config check every 12 (60 s)
+    let mut config_rejected:     bool   = false;
+    let mut rejection_reason:    String = String::new();
+    let mut rollback_watch:      Option<(Vec<DeviceConfig>, u32)> = None;
+    let mut last_config_version: i64    = 0; // tracks last applied config_version; 0 = not yet seeded
 
     loop {
         sleep(Duration::from_secs(5)).await;
@@ -2499,7 +2505,7 @@ async fn run_cloud_sync_loop(
             .unwrap_or_default()
         };
 
-        if rows.is_empty() { continue; }
+        // Even with no rows, POST proceeds so the cloud can return config_update flags.
 
         // ── Rollback watch ─────────────────────────────────────────────────
         if let Some((ref old_cfg, ref mut ticks)) = rollback_watch {
@@ -2613,44 +2619,62 @@ async fn run_cloud_sync_loop(
         match result {
             Ok(resp) if resp.status().is_success() => {
                 // Mark all rows in the batch as synced using safe integer list
-                let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-                let sql     = format!("UPDATE meter_history SET synced = 1 WHERE id IN ({id_list})");
-                { let conn = db.lock().unwrap(); let _ = conn.execute(&sql, []); }
+                if !ids.is_empty() {
+                    let id_list = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+                    let sql     = format!("UPDATE meter_history SET synced = 1 WHERE id IN ({id_list})");
+                    { let conn = db.lock().unwrap(); let _ = conn.execute(&sql, []); }
+                }
                 eprintln!("[sync] ✔ {} row(s) synced to cloud", ids.len());
 
                 // ── Parse response body for admin flags ───────────────────
                 let body: serde_json::Value = resp.json().await.unwrap_or_default();
 
-                // ── config_update ─────────────────────────────────────────
-                if body.get("config_update").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    if let Some(desired) = body.get("desired_config") {
-                        if let Ok(new_devices) = serde_json::from_value::<Vec<DeviceConfig>>(desired.clone()) {
-                            // Snapshot old config for potential rollback
-                            let old_config: Vec<DeviceConfig> = {
-                                let conn = db.lock().unwrap();
-                                let json: String = conn.query_row(
-                                    "SELECT config_json FROM device_config WHERE id = 1", [], |r| r.get(0),
-                                ).unwrap_or_else(|_| "[]".to_string());
-                                serde_json::from_str(&json).unwrap_or_default()
-                            };
-                            // Write new config to DB
-                            let new_json = serde_json::to_string(&new_devices).unwrap_or_default();
-                            { let conn = db.lock().unwrap(); let _ = conn.execute(
-                                "INSERT OR REPLACE INTO device_config (id, config_json) VALUES (1, ?1)",
-                                params![new_json],
-                            ); }
-                            // Update SharedEngine in memory
-                            { let mut eng = engine.lock().unwrap();
-                              eng.configured_devices = new_devices.clone();
-                              eng.consecutive_faults.clear(); }
-                            // Emit frontend event
-                            let config_version = body.get("config_version")
-                                .and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let _ = app.emit("config-updated",
-                                serde_json::json!({ "source": "remote", "config_version": config_version }));
-                            // Start 20-tick rollback watch window
-                            rollback_watch = Some((old_config, 0));
-                            eprintln!("[sync] Remote config applied (version: {config_version})");
+                // ── config_update (version-comparison primary, boolean secondary) ──
+                let response_version = body.get("config_version").and_then(|v| v.as_i64()).unwrap_or(0);
+                let config_update_bool = body.get("config_update").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                // Seed last_config_version on first successful ingest so we don't
+                // spuriously apply a config that was already active before this run.
+                if last_config_version == 0 {
+                    last_config_version = response_version;
+                } else {
+                    let version_advanced = response_version > last_config_version;
+                    if version_advanced || config_update_bool {
+                        if let Some(desired) = body.get("desired_config").filter(|v| v.is_array() || v.is_object()) {
+                            let devices_val = desired.get("devices").unwrap_or(desired);
+                            match serde_json::from_value::<Vec<DeviceConfig>>(devices_val.clone()) {
+                                Ok(new_devices) => {
+                                // Snapshot old config for potential rollback
+                                let old_config: Vec<DeviceConfig> = {
+                                    let conn = db.lock().unwrap();
+                                    let json: String = conn.query_row(
+                                        "SELECT config_json FROM device_config WHERE id = 1", [], |r| r.get(0),
+                                    ).unwrap_or_else(|_| "[]".to_string());
+                                    serde_json::from_str(&json).unwrap_or_default()
+                                };
+                                // Write new config to DB
+                                let new_json = serde_json::to_string(&new_devices).unwrap_or_default();
+                                { let conn = db.lock().unwrap(); let _ = conn.execute(
+                                    "INSERT OR REPLACE INTO device_config (id, config_json) VALUES (1, ?1)",
+                                    params![new_json],
+                                ); }
+                                // Update SharedEngine in memory
+                                { let mut eng = engine.lock().unwrap();
+                                  eng.configured_devices = new_devices.clone();
+                                  eng.consecutive_faults.clear(); }
+                                // Emit frontend event
+                                let config_version_str = response_version.to_string();
+                                let _ = app.emit("config-updated",
+                                    serde_json::json!({ "source": "remote", "config_version": config_version_str }));
+                                // Start 20-tick rollback watch window
+                                rollback_watch = Some((old_config, 0));
+                                last_config_version = response_version;
+                                eprintln!("[sync] Remote config applied (version: {response_version})");
+                                }
+                                Err(e) => {
+                                    eprintln!("[sync] desired_config deserialize failed: {e}");
+                                }
+                            }
                         }
                     }
                 }

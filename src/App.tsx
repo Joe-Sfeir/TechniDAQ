@@ -2669,8 +2669,9 @@ export default function App() {
       // Auto-select first tab
       if(confirmed.length>0)setActiveTab(confirmed[0].device_name);
       setShowModal(false);
-      setLatestByDevice({});
-      setHistoryByDevice({});
+      const keepNames = new Set(confirmed.map(d => d.device_name));
+      setLatestByDevice(prev => Object.fromEntries(Object.entries(prev).filter(([k]) => keepNames.has(k))));
+      setHistoryByDevice(prev => Object.fromEntries(Object.entries(prev).filter(([k]) => keepNames.has(k))));
       const totalRegs=confirmed.reduce((s,d)=>s+d.selected_registers.length,0);
       showToast(`${confirmed.length} device${confirmed.length>1?"s":""} configured · ${totalRegs} registers`,"success");
     } catch(e){showToast(`Config error: ${e}`,"error");}
