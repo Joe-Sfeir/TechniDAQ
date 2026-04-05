@@ -32,10 +32,18 @@ export async function invokeApi<T = unknown>(
   cmd: string,
   args?: Record<string, unknown>,
 ): Promise<T> {
+  console.log(`[invokeApi] Calling "${cmd}" with args:`, args);
   if (isTauri) {
     // Dynamic import: Tauri module only loaded inside the native webview.
     const { invoke } = await import("@tauri-apps/api/core");
-    return invoke<T>(cmd, args);
+    try {
+      const result = await invoke<T>(cmd, args);
+      console.log(`[invokeApi] "${cmd}" success:`, result);
+      return result;
+    } catch(e) {
+      console.error(`[invokeApi] "${cmd}" error:`, e);
+      throw e;
+    }
   }
   // Web path: relative URL → same origin → no hardcoded IP needed.
   const res = await fetch(`/api/${cmd}`, {
@@ -45,9 +53,12 @@ export async function invokeApi<T = unknown>(
   });
   if (!res.ok) {
     const text = await res.text();
+    console.error(`[invokeApi] HTTP error for "${cmd}":`, res.status, text);
     throw new Error(text || `HTTP ${res.status}`);
   }
-  return res.json() as Promise<T>;
+  const result = await res.json() as Promise<T>;
+  console.log(`[invokeApi] "${cmd}" success (web):`, result);
+  return result;
 }
 
 // ── Event bridge ───────────────────────────────────────────────────────────────

@@ -39,5 +39,11 @@
     "resources":       ["profiles.json"]
   },
   "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYxNTQ1Qzc2NTc5OTc3RDEKUldUUmQ1bFhkbHhVOFRieEVsbUJ5eXBLd2VIWFUrYXI1TmZzdnVtamFUQlo4bGd4c0ZkWXpTS04K",
+      "endpoints": [
+        "https://github.com/Joe-Sfeir/TechniDAQ/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

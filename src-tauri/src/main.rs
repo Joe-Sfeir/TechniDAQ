@@ -43,9 +43,11 @@ use tokio_serial::SerialStream;
 
 const MASTER_KEY_HEX:       &str = "d12a45fa8285f9d64a696ec883d0d429c7581d520bd4a92b801ff3c7f953d8ca";
 #[cfg(feature = "cloud_sync")]
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+#[cfg(feature = "cloud_sync")]
 const CLOUD_API_URL: &str = match option_env!("CLOUD_API_URL") {
     Some(v) => v,
-    None    => "https://technicloudapi-production.up.railway.app",
+    None    => "https://technicloudapi-copy-production.up.railway.app",
 };
 const PORT_TIMEOUT_MS:      u64  = 500;
 /// Minimum gap between consecutive Modbus frames on the same RS485 bus (turnaround time).
@@ -1335,6 +1337,28 @@ struct BuildInfo {
     cloud_url: String,
 }
 
+/// Download and install the latest release, then restart the app.
+/// The updater reads the endpoint and public key from tauri.conf.json.
+#[cfg(feature = "cloud_sync")]
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let update = app
+        .updater_builder()
+        .build()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(update) = update {
+        update.download_and_install(|_, _| {}, || {})
+            .await
+            .map_err(|e| e.to_string())?;
+        app.restart();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn get_build_info() -> BuildInfo {
     BuildInfo {
@@ -2434,6 +2458,7 @@ async fn run_cloud_sync_loop(
     let mut rejection_reason:    String = String::new();
     let mut rollback_watch:      Option<(Vec<DeviceConfig>, u32)> = None;
     let mut last_config_version: i64    = 0; // tracks last applied config_version; 0 = not yet seeded
+    let mut update_notified:     bool   = false; // emit update-available at most once per session
 
     loop {
         sleep(Duration::from_secs(5)).await;
@@ -2628,6 +2653,17 @@ async fn run_cloud_sync_loop(
 
                 // ── Parse response body for admin flags ───────────────────
                 let body: serde_json::Value = resp.json().await.unwrap_or_default();
+
+                // ── Update notification (once per session) ────────────────
+                if !update_notified {
+                    if let Some(latest) = body.get("latest_app_version").and_then(|v| v.as_str()) {
+                        if latest != APP_VERSION {
+                            let _ = app.emit("update-available",
+                                serde_json::json!({ "version": latest, "current": APP_VERSION }));
+                            update_notified = true;
+                        }
+                    }
+                }
 
                 // ── config_update (version-comparison primary, boolean secondary) ──
                 let response_version = body.get("config_version").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -3445,6 +3481,7 @@ fn main() {
         save_notification_email, get_notification_email,
         set_diagnostics_enabled,
         save_export_path, get_export_path,
+        install_update,
     ]);
 
     #[cfg(not(feature = "cloud_sync"))]
@@ -3457,6 +3494,9 @@ fn main() {
         set_diagnostics_enabled,
         save_export_path, get_export_path,
     ]);
+
+    #[cfg(feature = "cloud_sync")]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
 
     builder
         .build(tauri::generate_context!())

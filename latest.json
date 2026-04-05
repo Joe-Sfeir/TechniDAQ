@@ -1,0 +1,11 @@
+{
+  "version": "0.2.0",
+  "notes": "Test OTA update — UI redesign",
+  "pub_date": "2026-04-04T12:00:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "PASTE_THE_CONTENT_OF_THE_.sig_FILE_HERE",
+      "url": "https://github.com/Joe-Sfeir/TechniDAQ/releases/download/v0.2.0/TechniDAQ_0.2.0_x64-setup.exe"
+    }
+  }
+}

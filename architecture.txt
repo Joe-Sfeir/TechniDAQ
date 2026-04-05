@@ -1,6 +1,6 @@
 ================================================================================
 TECHNIDAQ POWERMETER DEMO — ARCHITECTURE SNAPSHOT
-Generated: 2026-03-17
+Generated: 2026-04-05
 ================================================================================
 
 DIRECTORY TREE
@@ -31,7 +31,26 @@ powermeter-demo/
 │   │   ├── logo1.png
 │   │   ├── logo2.png
 │   │   └── react.svg
+│   ├── components/
+│   │   ├── AppHeader.tsx
+│   │   ├── AuthLoadingScreen.tsx
+│   │   ├── BackgroundGrid.tsx
+│   │   ├── BusBar.tsx
+│   │   ├── ComPortSelector.tsx
+│   │   ├── DeviceSetupModal.tsx
+│   │   ├── DeviceTabBar.tsx
+│   │   ├── DiagTerminal.tsx
+│   │   ├── ExportDropdown.tsx
+│   │   ├── LicenseGateway.tsx
+│   │   ├── LogoutModal.tsx
+│   │   ├── MetricCard.tsx
+│   │   ├── ProjectGateway.tsx
+│   │   ├── Toast.tsx
+│   │   └── WaveformChart.tsx
+│   ├── constants.ts
 │   ├── main.tsx
+│   ├── theme.ts
+│   ├── types.ts
 │   └── vite-env.d.ts
 ├── src-tauri/
 │   ├── build.rs
@@ -79,35 +98,63 @@ Notes:
   - All @tauri-apps/* imports are DYNAMIC to avoid crashing plain browser loads.
   - Web fallback POSTs to relative URL /api/<cmd> (same-origin, intranet).
 
---- src/App.tsx ---
-Exports: default function App  (single default export)
-Imports (local): ./api  (invokeApi, listenApi, isTauri, UnlistenFn), ./assets/logo.png, ./App.css
+--- src/types.ts ---
+All shared TypeScript interfaces and type aliases (extracted from App.tsx in Phase 5).
+Exports:
+  RegisterEntry, MeterProfile, DeviceConfig, MeterReading,
+  FaultEvent, StatusEvent, AuthState, DiagEvent, BuildInfo, OnlineAuthState
 
-Sub-components (defined in same file, not exported):
-  regPalette(name, idx)        — maps register name → color palette entry
-  MetricCard                   — live register value card with sparkline + alarm animation
-  DeviceTabBar                 — per-device tab strip with live-indicator dots
-  WaveformChart                — Recharts line chart for historical readings
-  ExportDropdown               — export-to-Excel dropdown with time-range options
-  Toast                        — transient notification overlay
-  ComPortSelector              — COM port dropdown (COM1–COM12)
-  AppHeader                    — top navigation bar (logo, status pill, theme toggle, tray)
-  BusBar                       — configured device summary bar with polling controls
-  DevicePanel                  — individual device slot editor inside setup modal
-  DeviceSetupModal             — full-screen configuration wizard (multi-device slots)
-  LicenseGateway               — license activation form (key + username + project)
-  LogoutModal                  — logout confirmation dialog
-  AuthLoadingScreen            — splash shown while auth state is loading
-  DiagTerminal                 — scrollable hex frame diagnostic console
+  OnlineAuthState — cloud-registered machine auth state:
+    valid, machine_id, machine_api_key, project_id, project_name,
+    tier, allowed_meters, protocols, expires_at, node_name, cloud_url
+
+  BuildInfo — is_cloud_build: bool, cloud_url: string
+
+Type aliases: PollState, Theme, ExportStatus, ChartPoint, ViewMode
+
+--- src/theme.ts ---
+Design system tokens and helpers (extracted from App.tsx in Phase 5).
+Exports:
+  LIGHT_THEME / DARK_THEME  — full token objects (bg, surface, border, accent, text, muted,
+                               danger, amber, green, sidebar, cardShadow)
+  CLR                       — accent palette (blue, green, amber, red, purple, teal, orange, indigo)
+  glass(isDark, accent?)    — card surface CSSProperties helper
+  DOT_GRID_CSS              — injected dot-grid page background + theme keyframes
+  TAB_ACCENTS               — ordered accent colors for per-device tabs
+  LINE_COLORS               — ordered hex colors for Recharts line series
+  regPalette(name, idx)     — maps register name → color palette entry
+
+--- src/constants.ts ---
+Shared constants (extracted from App.tsx in Phase 5).
+Exports:
+  MAX_HISTORY    — 60 (rolling history buffer length)
+  COM_PORTS      — ["COM1"…"COM12"]
+  DATA_TYPES     — ["Float32","UInt16","UInt32","INT16","INT32"]
+  DEFAULT_DEVICE — factory function returning a blank DeviceConfig
+
+--- src/App.tsx ---
+Phase 5 (High-Contrast Tabbed SCADA Dashboard).
+Exports: default function App  (single default export)
+Imports (local): ./api, ./App.css, ./types, ./theme, ./constants,
+                 and all components from ./components/*
+
+All sub-components, types, and design tokens have been moved to separate modules.
+App.tsx now contains only top-level state management, event wiring, and layout composition.
 
 Key state in App:
   activeTab          — currently selected device tab name
-  readings           — Map<device_name, MeterReading>   (latest per device)
-  history            — Map<device_name, MeterReading[]>  (rolling 60-point buffer)
+  latestByDevice     — Record<device_name, MeterReading>   (latest per device)
+  historyByDevice    — Record<device_name, ChartPoint[]>   (rolling 60-point buffer)
   authState          — AuthState (gates all controls until licensed)
   pollState          — "running" | "stopped" | "fault"
   configuredDevices  — DeviceConfig[]
   theme              — "dark" | "light" (persisted to localStorage)
+  isCloudBuild       — bool (set from get_build_info at startup)
+  cloudUrl           — string (cloud API base URL for online builds)
+  onlineAuthState    — OnlineAuthState | null (cloud registration state)
+  onlineOffline      — bool (cloud build running without network)
+  updateAvailable    — { version, current } | null (app update banner)
+  gatewayMessage     — string | undefined (message shown on ProjectGateway)
 
 Tauri invokes (via invokeApi):
   get_build_info()                                    → BuildInfo
@@ -126,21 +173,59 @@ Tauri invokes (via invokeApi):
   save_export_path({ path })                          → void
 
 Events listened (via listenApi):
-  "meter-data"       → MeterReading  (updates readings + history maps)
+  "meter-data"       → MeterReading  (updates latestByDevice + historyByDevice)
   "status-changed"   → StatusEvent   (updates pollState)
   "meter-fault"      → FaultEvent    (shows toast)
   "diag-frame"       → DiagEvent     (appends to DiagTerminal lines)
 
-TypeScript interfaces defined in App.tsx:
-  RegisterEntry, MeterProfile, DeviceConfig, MeterReading,
-  FaultEvent, StatusEvent, AuthState, DiagEvent, BuildInfo
+--- src/components/AppHeader.tsx ---
+Top navigation bar: logo, build/version info, status pill, theme toggle, tray controls.
 
-Type aliases: PollState, Theme, ExportStatus, ChartPoint, ViewMode
+--- src/components/AuthLoadingScreen.tsx ---
+Splash screen shown while initial auth state is loading from the backend.
 
-Design system:
-  CLR       — token object (bgPage, bgCard, bgHeader, bgTabBar, border, text1/2/3, brand accents)
-  glass()   — glassmorphism CSSProperties helper (backdrop-filter blur, translucent background)
-  DOT_GRID_CSS — injected dot-grid page background (CSS custom properties per theme)
+--- src/components/BackgroundGrid.tsx ---
+Dot-grid page background component; injects DOT_GRID_CSS into <head> once on mount.
+
+--- src/components/BusBar.tsx ---
+Configured-device summary bar with polling start/stop controls and device status indicators.
+
+--- src/components/ComPortSelector.tsx ---
+COM port dropdown selector (COM1–COM12).
+
+--- src/components/DeviceSetupModal.tsx ---
+Full-screen configuration wizard for multi-device bus setup (device slots, register selection).
+Contains DevicePanel sub-component (individual device slot editor).
+
+--- src/components/DeviceTabBar.tsx ---
+Per-device tab strip with live-indicator dots and per-tab accent colors.
+
+--- src/components/DiagTerminal.tsx ---
+Scrollable hex-frame diagnostic console for Modbus TX/RX frames.
+Exports: default DiagTerminal, type DiagLine
+
+--- src/components/ExportDropdown.tsx ---
+Export-to-Excel dropdown with time-range options and export status feedback.
+
+--- src/components/LicenseGateway.tsx ---
+License activation form: key + username + project fields, offline activation flow.
+
+--- src/components/LogoutModal.tsx ---
+Logout confirmation dialog.
+
+--- src/components/MetricCard.tsx ---
+Live register value card with sparkline and alarm animation (pulse-red / pulse-amber).
+
+--- src/components/ProjectGateway.tsx ---
+Cloud/online project gateway screen shown when cloud_sync build requires online auth
+or when the machine is not yet registered to a project.
+
+--- src/components/Toast.tsx ---
+Transient notification overlay (success / error / warning variants).
+Exports: default Toast, type ToastState
+
+--- src/components/WaveformChart.tsx ---
+Recharts line chart for historical register readings (rolling 60-point buffer).
 
 --- src-tauri/src/lib.rs ---
 Single function: pub fn run()
@@ -395,10 +480,14 @@ LAYER DIAGRAM
 -------------
 
   ┌─────────────────────────────────────────────────────────────┐
-  │  React 19 + TypeScript Frontend  (src/App.tsx)              │
-  │  - Single component file; sub-components defined inline     │
+  │  React 19 + TypeScript Frontend                             │
+  │  src/App.tsx          — state management + layout           │
+  │  src/components/*.tsx — 15 extracted component modules      │
+  │  src/types.ts         — shared interfaces + type aliases    │
+  │  src/theme.ts         — design tokens, helpers, palettes    │
+  │  src/constants.ts     — shared constants + defaults         │
   │  - Recharts for historical waveform charts                  │
-  │  - Tailwind CSS v3 + custom glassmorphism design system     │
+  │  - Tailwind CSS v3 + custom high-contrast design system     │
   │  - Auth-gated: all controls disabled until license valid    │
   └────────────────┬────────────────────────┬───────────────────┘
                    │ Tauri IPC              │ fetch POST /api/*

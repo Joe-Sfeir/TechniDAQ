@@ -8,7 +8,7 @@ edition = "2021"
 # To produce an online/cloud build: cargo tauri build --features cloud_sync
 [features]
 default    = []
-cloud_sync = ["dep:lettre", "dep:reqwest"]
+cloud_sync = ["dep:lettre", "dep:reqwest", "dep:tauri-plugin-updater"]
 
 [lib]
 name       = "powermeter_demo_lib"
@@ -22,6 +22,7 @@ tauri               = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener          = "2"
 tauri-plugin-dialog          = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-updater         = { version = "2", optional = true }
 serde               = { version = "1", features = ["derive"] }
 serde_json          = "1"
 rusqlite            = { version = "0.31", features = ["bundled"] }
