@@ -1,6 +1,5 @@
-import { TAB_ACCENTS } from "../theme";
+import { TAB_ACCENTS, DARK_THEME, LIGHT_THEME } from "../theme";
 import type { DeviceConfig } from "../types";
-import { Settings2 } from "lucide-react";
 
 // ─── BusBar ───────────────────────────────────────────────────────────────────
 
@@ -9,34 +8,45 @@ export default function BusBar({ configuredDevices, onOpenModal, isDark }:{
   onOpenModal:()=>void; isDark:boolean;
 }) {
   return (
-    <div className="flex items-center gap-3 px-5 h-[38px] shrink-0 bg-zinc-50 dark:bg-[#0a0a0a]/50 backdrop-blur-sm border-b border-zinc-200 dark:border-white/10">
-      
-      <button 
-        onClick={onOpenModal} 
-        className="flex items-center gap-1.5 px-3 h-[26px] bg-[#1a5fff]/10 border border-[#1a5fff]/50 rounded-md text-[#1a5fff] font-bold text-[0.7rem] tracking-[0.1em] uppercase hover:bg-[#1a5fff]/20 transition-colors"
-      >
-        <Settings2 className="w-3 h-3" />
+    <div style={{
+      display:"flex",alignItems:"center",gap:"10px",
+      padding:"0 20px",height:"38px",flexShrink:0,
+      background: isDark ? DARK_THEME.sidebar : LIGHT_THEME.sidebar,
+      borderBottom:`1px solid ${isDark ? DARK_THEME.border : LIGHT_THEME.border}`,
+    }}>
+      <button onClick={onOpenModal} style={{
+        display:"flex",alignItems:"center",gap:"6px",
+        padding:"0 12px",height:"26px",
+        background:isDark ? DARK_THEME.accentDim : LIGHT_THEME.accentDim,
+        border:`1px solid ${isDark ? DARK_THEME.accent+"50" : LIGHT_THEME.accent+"50"}`,
+        borderRadius:"6px",
+        color:isDark ? DARK_THEME.accent : LIGHT_THEME.accent,
+        fontFamily:"'Rajdhani',sans-serif",fontWeight:700,
+        fontSize:"0.7rem",letterSpacing:"0.1em",textTransform:"uppercase",
+        cursor:"pointer",opacity:1,
+      }}>
+        <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth={2.5}>
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        </svg>
         Configure Bus
       </button>
-
-      {configuredDevices.length > 0 && (
+      {configuredDevices.length>0 && (
         <>
-          <span className="text-zinc-300 dark:text-white/10 text-[0.8rem]">|</span>
-          
-          {configuredDevices.map((d, i) => (
-            <div key={d.device_name} className="flex items-center gap-1.5">
-              <div 
-                className="w-1.5 h-1.5 rounded-full" 
-                style={{ background: TAB_ACCENTS[i % TAB_ACCENTS.length] }} 
-              />
-              <span className="font-mono text-[0.58rem] text-zinc-500 dark:text-zinc-400 tracking-[0.05em]">
-                {d.device_name} · S{d.slave_id} · {d.poll_rate_ms / 1000}s
+          <span style={{ color:isDark ? DARK_THEME.border : LIGHT_THEME.border,fontSize:"0.8rem" }}>|</span>
+          {configuredDevices.map((d,i)=>(
+            <div key={d.device_name} style={{ display:"flex",alignItems:"center",gap:"5px" }}>
+              <div style={{ width:"5px",height:"5px",borderRadius:"50%",
+                background:TAB_ACCENTS[i%TAB_ACCENTS.length] }}/>
+              <span style={{ fontFamily:"'Share Tech Mono',monospace",fontSize:"0.58rem",
+                color:isDark ? DARK_THEME.muted : LIGHT_THEME.muted,letterSpacing:"0.05em" }}>
+                {d.device_name} · S{d.slave_id} · {d.poll_rate_ms/1000}s
               </span>
             </div>
           ))}
-          
-          <span className="ml-auto font-mono text-[0.54rem] text-zinc-400 dark:text-zinc-500">
-            {configuredDevices.reduce((s, d) => s + d.selected_registers.length, 0)} registers total
+          <span style={{ marginLeft:"auto",fontFamily:"'Share Tech Mono',monospace",
+            fontSize:"0.54rem",color:isDark ? DARK_THEME.muted2 : LIGHT_THEME.muted2 }}>
+            {configuredDevices.reduce((s,d)=>s+d.selected_registers.length,0)} registers total
           </span>
         </>
       )}

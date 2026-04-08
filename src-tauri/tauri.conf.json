@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/schema.json",
   "productName": "TechniDAQ",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.technicatgroup.technidaq",
   "build": {
     "beforeDevCommand":   "npm run dev",
@@ -27,9 +27,8 @@
     ]
   },
   "bundle": {
-    "active":                true,
-    "targets":               "all",
-    "createUpdaterArtifacts": true,
+    "active":          true,
+    "targets":         "all",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -37,7 +36,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources":       ["profiles.json"]
+    "resources":       ["profiles.json"],
+    "createUpdaterArtifacts": true
+
   },
   "plugins": {
     "updater": {
